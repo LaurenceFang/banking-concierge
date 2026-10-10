@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0.0",
+  "plan_id": "demo-plan-001",
+  "version": 1,
+  "action": "transfer",
+  "actor_id": "demo-user-001",
+  "source_account_id": "demo-checking-001",
+  "recipient_id": "demo-recipient-001",
+  "destination_account_id": "demo-saving-001",
+  "amount_minor": 80000,
+  "fee_minor": 500,
+  "total_debit_minor": 80500,
+  "currency": "CNY",
+  "execute_at": "2026-10-10T10:00:00+08:00",
+  "expires_at": "2026-10-10T10:10:00+08:00",
+  "policy_version": "demo-policy-v1",
+  "account_state_version": 1,
+  "plan_hash": "8dad8b7411ec46c4ce89c3424f7aa1e0a3c0ee049088583e4fab55303870c4f6"
+}
