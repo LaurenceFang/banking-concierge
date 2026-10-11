@@ -1,4 +1,15 @@
-import type { ChatResponse, DecisionResponse, Overview } from "./types";
+import type {
+  ChatResponse,
+  DecisionResponse,
+  Overview,
+  Conversation,
+  ConversationDetail,
+  BillingReport,
+  ImportResult,
+  SubscriptionAction,
+  SubscriptionList,
+  Action,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -159,11 +170,66 @@ export async function streamChat(
   }
   return result;
 }
-export const decidePlan = (planId: string, decision: "approve" | "decline") =>
+export const decidePlan = (
+  planId: string,
+  decision: "approve" | "decline",
+  conversationId?: string,
+) =>
   request<DecisionResponse>(`/plans/${encodeURIComponent(planId)}/decision`, {
     method: "POST",
-    body: JSON.stringify({ decision }),
+    body: JSON.stringify({ decision, conversation_id: conversationId }),
   });
+
+export const getConversations = () =>
+  request<{ conversations: Conversation[] }>("/conversations");
+export const createConversation = () =>
+  request<Conversation>("/conversations", { method: "POST", body: "{}" });
+export const renameConversation = (id: string, title: string) =>
+  request<Conversation>(`/conversations/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ title }),
+  });
+export const getConversation = (id: string) =>
+  request<ConversationDetail>(`/conversations/${encodeURIComponent(id)}`);
+export const markRead = (id: string) =>
+  request(`/conversations/${encodeURIComponent(id)}/read`, { method: "POST" });
+export const getBillingReport = (start: string, end: string) =>
+  request<BillingReport>(
+    `/billing/report?${new URLSearchParams({ ...(start ? { start } : {}), ...(end ? { end } : {}) })}`,
+  );
+export const importBilling = (filename: string, content: string) =>
+  request<ImportResult>("/billing/import", {
+    method: "POST",
+    body: JSON.stringify({ filename, content }),
+  });
+export const getSubscriptions = () =>
+  request<SubscriptionList>("/subscriptions");
+export const previewSubscription = (
+  id: string,
+  action: SubscriptionAction["action"],
+  conversationId: string,
+) =>
+  request<SubscriptionAction>(
+    `/subscriptions/${encodeURIComponent(id)}/preview`,
+    {
+      method: "POST",
+      body: JSON.stringify({ action, conversation_id: conversationId }),
+    },
+  );
+export const decideAction = (
+  action: Action,
+  decision: "approve" | "decline",
+  conversationId: string,
+) =>
+  action.kind === "transfer"
+    ? decidePlan(action.id, decision, conversationId)
+    : request<DecisionResponse>(
+        `/subscription-plans/${encodeURIComponent(action.id)}/decision`,
+        {
+          method: "POST",
+          body: JSON.stringify({ decision, conversation_id: conversationId }),
+        },
+      );
 
 export const money = (minor: number, currency = "CNY") =>
   new Intl.NumberFormat("zh-CN", {

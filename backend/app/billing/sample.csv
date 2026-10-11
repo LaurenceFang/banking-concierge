@@ -1,0 +1,3 @@
+transaction_id,date,merchant,amount,currency,account_id,transaction_type,category,notes
+sample-coffee-001,2026-10-03,木棉咖啡,-28.50,CNY,demo-checking-001,expense,餐饮,周末咖啡
+sample-refund-001,2026-10-04,星云视频,7.90,CNY,demo-checking-001,refund,数字娱乐,部分退款

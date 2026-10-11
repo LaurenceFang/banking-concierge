@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
@@ -207,9 +208,7 @@ class BankService:
 
     def _list_accounts(self, session: Session) -> list[dict[str, Any]]:
         rows = session.scalars(
-            select(Account)
-            .where(Account.owner_id == DEMO_USER_ID)
-            .order_by(Account.kind, Account.id)
+            select(Account).where(Account.owner_id == DEMO_USER_ID).order_by(Account.kind, Account.id)
         ).all()
         return [
             {
@@ -226,9 +225,7 @@ class BankService:
         with self._session_factory() as session:
             return self._list_transactions(session, account_id)
 
-    def _list_transactions(
-        self, session: Session, account_id: str | None = None
-    ) -> list[dict[str, Any]]:
+    def _list_transactions(self, session: Session, account_id: str | None = None) -> list[dict[str, Any]]:
         query = (
             select(LedgerTransaction)
             .join(Account, LedgerTransaction.account_id == Account.id)
@@ -236,11 +233,12 @@ class BankService:
         )
         if account_id is not None:
             query = query.where(Account.id == account_id)
-            if session.scalar(
-                select(Account.id).where(
-                    Account.id == account_id, Account.owner_id == DEMO_USER_ID
+            if (
+                session.scalar(
+                    select(Account.id).where(Account.id == account_id, Account.owner_id == DEMO_USER_ID)
                 )
-            ) is None:
+                is None
+            ):
                 raise BankError("ACCOUNT_NOT_FOUND", "未找到当前演示用户的该账户。")
         rows = session.scalars(
             query.order_by(LedgerTransaction.created_at.desc(), LedgerTransaction.id.desc())
@@ -313,9 +311,7 @@ class BankService:
             if source is None:
                 raise BankError("ACCOUNT_NOT_FOUND", "未找到当前演示用户的出账账户。")
             recipient = session.scalar(
-                select(Recipient).where(
-                    Recipient.id == recipient_id, Recipient.owner_id == DEMO_USER_ID
-                )
+                select(Recipient).where(Recipient.id == recipient_id, Recipient.owner_id == DEMO_USER_ID)
             )
             if recipient is None:
                 raise BankError("RECIPIENT_NOT_FOUND", "未找到明确的收款人，请先选择联系人。")
@@ -406,9 +402,7 @@ class BankService:
                 return _decision_result("declined", plan.outcome_message)
 
             account_ids = sorted({plan.source_account_id, plan.destination_account_id})
-            account_query = (
-                select(Account).where(Account.id.in_(account_ids)).order_by(Account.id)
-            )
+            account_query = select(Account).where(Account.id.in_(account_ids)).order_by(Account.id)
             if self.dialect_name == "postgresql":
                 account_query = account_query.with_for_update()
             locked_accounts = {row.id: row for row in session.scalars(account_query).all()}
@@ -428,9 +422,7 @@ class BankService:
                 plan.outcome_code = "INSUFFICIENT_BALANCE"
                 plan.outcome_message = "账户余额已不足，转账未执行，请重新查询余额并创建计划。"
                 plan.decided_at = now
-                return _decision_result(
-                    "declined", plan.outcome_message, code="INSUFFICIENT_BALANCE"
-                )
+                return _decision_result("declined", plan.outcome_message, code="INSUFFICIENT_BALANCE")
 
             operation_id = f"op-{uuid4()}"
             source.balance_minor -= plan.total_minor
@@ -464,9 +456,7 @@ class BankService:
             plan.outcome_message = "转账已完成，账本已更新。"
             plan.operation_id = operation_id
             plan.decided_at = now
-            return _decision_result(
-                "completed", plan.outcome_message, operation_id=operation_id
-            )
+            return _decision_result("completed", plan.outcome_message, operation_id=operation_id)
 
     def invalidate_pending_plans(self, conversation_id: str) -> int:
         if not conversation_id:
@@ -475,10 +465,66 @@ class BankService:
         with self._transaction() as session:
             return self._invalidate_pending_in_session(session, conversation_id, now)
 
+    def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+        """Read current plan state for a restored thread without approving it."""
+        with self._session_factory() as session:
+            plan = session.scalar(
+                select(TransferPlan).where(TransferPlan.id == plan_id, TransferPlan.owner_id == DEMO_USER_ID)
+            )
+            if plan is None:
+                return None
+            result = self._plan_dict(plan, self._recipient_name(session, plan.recipient_id))
+            if result["status"] == "pending" and _as_utc(plan.expires_at) <= _utcnow():
+                result["status"] = "expired"
+            result["conversation_id"] = plan.conversation_id
+            return result
+
+    def pending_for_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+        with self._session_factory() as session:
+            identity = session.scalar(
+                select(TransferPlan.id)
+                .where(
+                    TransferPlan.owner_id == DEMO_USER_ID,
+                    TransferPlan.conversation_id == conversation_id,
+                    TransferPlan.status == "pending",
+                    TransferPlan.expires_at > _utcnow(),
+                )
+                .order_by(TransferPlan.created_at.desc())
+                .limit(1)
+            )
+        return self.get_plan(identity) if identity else None
+
+    def completed_events(self) -> list[dict[str, Any]]:
+        with self._session_factory() as session:
+            plans = session.scalars(
+                select(TransferPlan)
+                .where(TransferPlan.owner_id == DEMO_USER_ID, TransferPlan.status == "completed")
+                .order_by(TransferPlan.decided_at.desc())
+            ).all()
+            return [
+                {
+                    "id": f"transfer:{p.operation_id}",
+                    "kind": "transfer",
+                    "source": "bank",
+                    "title": "转账已完成",
+                    "text": f"已向{self._recipient_name(session, p.recipient_id)}转账"
+                    f" {Decimal(p.amount_minor) / 100:,.2f} 元，账本已更新。",
+                    "created_at": _iso_utc(p.decided_at),
+                    "conversation_id": p.conversation_id,
+                    "operation_id": p.operation_id,
+                    "plan_id": p.id,
+                    "receipt": {
+                        "status": "completed",
+                        "message": p.outcome_message,
+                        "operation_id": p.operation_id,
+                        "conversation_id": p.conversation_id,
+                    },
+                }
+                for p in plans
+            ]
+
     @staticmethod
-    def _invalidate_pending_in_session(
-        session: Session, conversation_id: str, now: datetime
-    ) -> int:
+    def _invalidate_pending_in_session(session: Session, conversation_id: str, now: datetime) -> int:
         query = select(TransferPlan).where(
             TransferPlan.owner_id == DEMO_USER_ID,
             TransferPlan.conversation_id == conversation_id,
@@ -497,9 +543,7 @@ class BankService:
     @staticmethod
     def _recipient_name(session: Session, recipient_id: str) -> str:
         name = session.scalar(
-            select(Recipient.name).where(
-                Recipient.id == recipient_id, Recipient.owner_id == DEMO_USER_ID
-            )
+            select(Recipient.name).where(Recipient.id == recipient_id, Recipient.owner_id == DEMO_USER_ID)
         )
         return name or "收款人"
 

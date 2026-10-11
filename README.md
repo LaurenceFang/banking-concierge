@@ -8,9 +8,9 @@ A usability-first banking AI agent for Chinese-language workflows. Designed arou
 
 ## 当前状态
 
-项目采用 SPEC 驱动。首批三个开发包已集成：模拟银行、知识库检索和 React 前端，另包含 DeepSeek 官方适配与 LangGraph 编排。
+项目采用 SPEC 驱动。第二批已接入账单与订阅，并实现主会话、临时事项、通知回执和第四版界面。
 
-现在可查询账户与最近流水、消歧收款人、生成转账预览、确认或拒绝转账，并查看知识问答的引用资料。真实 DeepSeek `deepseek-flash`、PostgreSQL 和浏览器已联调。理财、卡片、订阅目前提供知识解释，其办理功能以及账单分析、跨场景联动尚待实现。
+现在可查询账户与流水、消歧收款人、预览和确认转账；导入 CSV、按日期统计净支出与退款、查看分类和异常提示；检测周期候选，并对已接入模拟订阅分别预览取消合同或停止代扣。会话和来源资料可刷新恢复，回执进入日常助手。理财、卡片和跨场景联动仍待实现。验收范围见 [第二批实施状态](specs/11-第二批实施状态.md)。
 
 ## 本地启动
 
@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
 
 ## 技术方向
 
-已采用 Python、FastAPI、Pydantic、LangGraph、SQLAlchemy／PostgreSQL 和 React／TypeScript／Vite。前端通过 SSE 展示进度和答复，转账预览与确认结果使用服务端事实。转账采用整数分、原子记账和幂等确认。
+已采用 Python、FastAPI、Pydantic、LangGraph、SQLAlchemy／PostgreSQL 和 React／TypeScript／Vite。前端通过 SSE 展示进度和答复，共享动作抽屉展示转账或订阅确认单。账单采用可解释规则作为基线，统计使用整数分；订阅检测包含商户归一化、周期、漏月和变价信息。转账与订阅动作采用原子状态更新和幂等确认。
 
 首轮 RAG 使用 Markdown 标题分块、中文分词与 BM25 检索，保留文档版本、标题和片段。涉及规则的问答先检索资料，实时余额和流水通过银行工具获取。向量检索、混合召回与重排保留在后续规格中，当前尚未启用。
 
@@ -50,9 +50,9 @@ uv run pytest -q
 uv run ruff check backend
 ```
 
-前端在 `web` 目录运行 `npm ci`、`npm test`、`npm run build`。开发模式分别启动 `uv run python -X utf8 -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000` 和 `npm run dev`；Vite 的 5173 端口代理到后端。
+前端在 `web` 目录运行 `npm.cmd ci`、`npm.cmd test`、`npm.cmd run build`。开发模式分别启动 `uv run python -X utf8 -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000` 和 `npm.cmd run dev`；Vite 的 5173 端口代理到后端。
 
-PostgreSQL 并发检查使用单独测试库，见 [首批实施状态](specs/10-首批实施状态.md)。本地应用为单用户演示，尚未接真实银行接口或部署到公网。
+PostgreSQL 并发检查只允许专用测试库 `127.0.0.1:55432/concierge_test`；设置 `BANK_TEST_DATABASE_URL` 和 `SUBSCRIPTIONS_TEST_DATABASE_URL` 后运行 pytest。测试会重建测试库的银行或订阅表，不能使用应用数据库。本地应用为单用户演示，尚未接真实银行、支付宝、鲜花商户或部署到公网。
 
 ## 开源许可
 
