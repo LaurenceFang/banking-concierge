@@ -28,3 +28,5 @@ _raw*
 Thumbs.db
 Desktop.ini
 .DS_Store
+*.tsbuildinfo
+web/design/concept-a.png

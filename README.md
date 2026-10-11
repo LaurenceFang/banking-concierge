@@ -1,6 +1,6 @@
 # 银小二 · Banking Concierge
 
-银行办事助手：理解中文金融需求，调用工具，在模拟银行中完成转账、账单、理财、卡片、订阅与跨场景任务。
+银行办事助手：理解中文金融需求，检索业务知识并调用模拟银行工具。目标覆盖转账、账单、理财、卡片、订阅与跨场景任务。
 
 **Banking Concierge** 表达“银小二”的服务角色：帮助用户理解业务、安排步骤并办理银行事务。
 
@@ -8,9 +8,23 @@ A usability-first banking AI agent for Chinese-language workflows. Designed arou
 
 ## 当前状态
 
-项目采用 SPEC 驱动。目前仓库包含工程规格、25 个模块的设计、转账接口契约及三份自写知识库种子资料，完整应用尚待实现。
+项目采用 SPEC 驱动。首批三个开发包已集成：模拟银行、知识库检索和 React 前端，另包含 DeepSeek 官方适配与 LangGraph 编排。
 
-DeepSeek 官方 `deepseek-flash` 已通过基础 JSON 与合成只读工具链验证；这不代表完整银行流程或 RAG 已运行。
+现在可查询账户与最近流水、消歧收款人、生成转账预览、确认或拒绝转账，并查看知识问答的引用资料。真实 DeepSeek `deepseek-flash`、PostgreSQL 和浏览器已联调。理财、卡片、订阅目前提供知识解释，其办理功能以及账单分析、跨场景联动尚待实现。
+
+## 本地启动
+
+需要 Python 3.11、[uv](https://docs.astral.sh/uv/)、Node.js 22 与 Docker Desktop。先启动 Docker Desktop，再在仓库目录运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
+```
+
+脚本安装锁定依赖、构建前端、启动 PostgreSQL 和应用。打开 **http://127.0.0.1:8000/**，保持终端运行；按 Ctrl+C 停止应用。数据库保留数据，下次启动不会重置余额。无需 Docker 的开发体验可加 `-SQLite`，其数据库与 PostgreSQL 独立。
+
+第一次配置 DeepSeek 密钥时，复制 `.env.example` 为 `.env`，填写 `DEEPSEEK_API_KEY`。也可通过环境变量提供密钥；Windows 支持读取当前用户本机已保存的 DPAPI 凭据。密钥不进入仓库。模型固定为官方 `deepseek-flash`，请求发往 `https://api.deepseek.com`。
+
+具体按钮与示例见 [使用指南](docs/使用指南.md)。当前固定使用虚构的林小满账户与模拟资金。
 
 ## 项目资料
 
@@ -24,9 +38,21 @@ DeepSeek 官方 `deepseek-flash` 已通过基础 JSON 与合成只读工具链�
 
 ## 技术方向
 
-计划采用 Python、FastAPI、Pydantic、LangGraph、PostgreSQL 和 React／TypeScript。可用性和完整用户路径优先，知识问答与业务工具衔接，保留必要身份、确认和资金一致性约束。
+已采用 Python、FastAPI、Pydantic、LangGraph、SQLAlchemy／PostgreSQL 和 React／TypeScript／Vite。前端通过 SSE 展示进度和答复，转账预览与确认结果使用服务端事实。转账采用整数分、原子记账和幂等确认。
 
-运行凭据通过环境变量或本机配置提供，样例见 [.env.example](.env.example)。安装与启动说明将在应用实现后补充。
+首轮 RAG 使用 Markdown 标题分块、中文分词与 BM25 检索，保留文档版本、标题和片段。涉及规则的问答先检索资料，实时余额和流水通过银行工具获取。向量检索、混合召回与重排保留在后续规格中，当前尚未启用。
+
+## 开发与检查
+
+```powershell
+uv sync --locked
+uv run pytest -q
+uv run ruff check backend
+```
+
+前端在 `web` 目录运行 `npm ci`、`npm test`、`npm run build`。开发模式分别启动 `uv run python -X utf8 -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000` 和 `npm run dev`；Vite 的 5173 端口代理到后端。
+
+PostgreSQL 并发检查使用单独测试库，见 [首批实施状态](specs/10-首批实施状态.md)。本地应用为单用户演示，尚未接真实银行接口或部署到公网。
 
 ## 开源许可
 
