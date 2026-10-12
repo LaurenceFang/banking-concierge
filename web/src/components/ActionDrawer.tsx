@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { decideAction, money, timestamp } from "../api";
 import type { Account, Action, DecisionResponse } from "../types";
+import { cardStatus } from "./CardsPage";
 interface Props {
   action: Action;
   accounts: Account[];
@@ -66,7 +67,7 @@ export function ActionDrawer({
     <aside className="action-drawer" aria-label={action.title}>
       <div className="drawer-heading">
         <div>
-          <h2>{action.title}</h2>
+          <h2>{action.kind==="wealth"?(action.action==="purchase"?"申购确认":"赎回确认"):action.title}</h2>
           <p className="muted">{expired ? "确认已过期" : "等待你确认"}</p>
         </div>
         <button
@@ -115,6 +116,29 @@ export function ActionDrawer({
             <p>有效期至：{timestamp(action.expires_at)}</p>
           </details>
         </>
+      ) : action.kind === "card" ? (
+        <>
+          <div className="subscription-effect"><h3>{action.card_name ?? (action.card_kind==="credit"?"信用卡申请":"借记卡申请")}</h3><p>{action.description}</p></div>
+          <dl className="transfer-fields">
+            {action.action==="set_daily_limit" || action.action==="set_credit_limit" ? <><div><dt>调整前</dt><dd>{money(Number(action.before[action.action==="set_daily_limit"?"daily_limit_minor":"credit_limit_minor"]??0))}</dd></div><div><dt>调整后</dt><dd>{money(action.amount_minor??0)}</dd></div></> : action.action!=="apply_card" ? <><div><dt>当前状态</dt><dd>{cardStatus[String(action.before.status)]??"请核对卡片状态"}</dd></div><div><dt>确认后</dt><dd>{cardStatus[String(action.after.status)]??"按确认单办理"}</dd></div></> : <div><dt>确认后</dt><dd>申请已提交，等待审核</dd></div>}
+          </dl>
+          <p className="muted small">所有规则均为模拟。申请不代表获批或发卡。</p>
+        </>
+      ) : action.kind === "wealth" ? (
+        <>
+          <div className="amount-block"><span className="muted">{action.action==="purchase"?"申购金额":"赎回份额本金"}</span><p>{money(action.amount_minor)}</p></div>
+          <dl className="transfer-fields">
+            <div><dt>产品</dt><dd>{action.product_name}</dd></div>
+            <div><dt>{action.action==="purchase"?"付款账户":"到账账户"}</dt><dd>{accounts.find(a=>a.id===action.account_id)?.name??"所选账户"}</dd></div>
+            <div><dt>产品风险</dt><dd>R{action.risk_level}</dd></div>
+            {action.action==="purchase" && <div><dt>风险档案</dt><dd>已完成适配校验</dd></div>}
+            <div><dt>{action.action==="purchase"?"申购费":"赎回费"}</dt><dd>{money(action.fee_minor)}</dd></div>
+            <div className="transfer-total"><dt>{action.action==="purchase"?"合计扣款":"预计到账"}</dt><dd>{money(action.action==="purchase"?action.total_minor:action.payout_minor)}</dd></div>
+            <div><dt>预计结算日</dt><dd>{action.settles_on}（T+1）</dd></div>
+          </dl>
+          <p className="p3-spacing">确认后：订单受理，待结算。<br/>{action.action==="purchase"?"结算完成后才计入持仓。":"先预占份额，结算完成后才到账。"}</p>
+          <p className="muted small p3-spacing">模拟产品，不承诺收益。</p>
+        </>
       ) : (
         <>
           <div className="subscription-effect">
@@ -149,6 +173,10 @@ export function ActionDrawer({
               ? "正在办理…"
               : action.kind === "transfer"
                 ? "确认转账"
+                : action.kind === "card"
+                  ? "确认办理"
+                : action.kind === "wealth"
+                  ? action.action === "purchase" ? "确认申购" : "确认赎回"
                 : action.action === "cancel_subscription"
                   ? "确认取消订阅"
                   : "确认停止代扣"}

@@ -799,7 +799,10 @@ def _bank_entry(transaction: LedgerTransaction, account: Account) -> dict[str, A
     merchant_raw = raw_description.split("·", 1)[0].strip() or raw_description
     merchant, alias_used = _normalize_merchant(merchant_raw)
     folded = raw_description.casefold()
-    if "期初" in folded or transaction.id.casefold().endswith("-open"):
+    wealth_fee = raw_description.startswith(("理财申购手续费", "理财赎回手续费"))
+    if wealth_fee:
+        kind = "expense"
+    elif "期初" in folded or transaction.id.casefold().endswith("-open"):
         kind = "opening"
     elif (
         transaction.operation_id is not None
@@ -811,6 +814,8 @@ def _bank_entry(transaction: LedgerTransaction, account: Account) -> dict[str, A
     else:
         kind = "expense" if transaction.amount_minor < 0 else "income"
     category, category_reason, confidence = _classify_category(merchant, kind)
+    if wealth_fee:
+        category, category_reason, confidence = "金融服务", "理财操作手续费，独立于资产本金", 1.0
     reason = "银行流水只读投影；" + category_reason
     if alias_used:
         reason += "；命中商户别名表"

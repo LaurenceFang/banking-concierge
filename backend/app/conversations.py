@@ -222,8 +222,10 @@ class ConversationStore:
         with self._lock, Session(self.engine) as session, session.begin():
             row, _ = self._require(session, identity)
             ids = {m.get("_event_id") for m in messages if m.get("_event_id")}
-            events = [m for m in json.loads(row.messages) if m.get("_event_id") and m["_event_id"] not in ids]
-            row.messages = json.dumps(messages + events, ensure_ascii=False)
+            current = {m["_event_id"]: m for m in json.loads(row.messages) if m.get("_event_id")}
+            events = [m for event_id, m in current.items() if event_id not in ids]
+            fresh = [current.get(m.get("_event_id"), m) for m in messages]
+            row.messages = json.dumps(fresh + events, ensure_ascii=False)
             row.updated_at = _now()
 
     def append_user(self, identity: str, text: str) -> str:
@@ -267,13 +269,24 @@ class ConversationStore:
     def note_decision(self, plan_id: str, message: str, receipt: dict | None = None):
         with self._lock, Session(self.engine) as session, session.begin():
             targets = set()
+            changed = set()
             for view in session.scalars(select(ViewMessage)).all():
                 payload = json.loads(view.payload)
                 action = payload.get("action") or payload.get("plan")
                 if not action or action.get("id") != plan_id:
                     continue
+                old_receipt = payload.get("receipt") or {}
+                if (
+                    receipt
+                    and old_receipt.get("order_id") == receipt.get("order_id")
+                    and old_receipt.get("order_status") == "settled"
+                    and receipt.get("order_status") == "pending_settlement"
+                ):
+                    # A late acceptance snapshot must not undo a newer settlement.
+                    continue
                 targets.add(view.conversation_id)
-                if receipt:
+                if receipt and old_receipt != receipt:
+                    changed.add(view.conversation_id)
                     payload["receipt"] = receipt
                     if payload.get("action"):
                         payload["action"]["status"] = receipt["status"]
@@ -284,16 +297,22 @@ class ConversationStore:
                 row, _ = self._require(session, identity)
                 history = json.loads(row.messages)
                 event = f"decision:{plan_id}"
-                if not any(m.get("_event_id") == event for m in history):
+                existing = next((m for m in history if m.get("_event_id") == event), None)
+                content = f"银行执行结果：{message}。已受理或已完成操作不能重复创建。"
+                if existing and existing["content"] == content and identity not in changed:
+                    continue
+                if existing:
+                    existing["content"] = content
+                else:
                     history.append(
                         {
                             "role": "system",
-                            "content": f"银行执行结果：{message}。已完成操作不能重复创建。",
+                            "content": content,
                             "_event_id": event,
                         }
                     )
-                    row.messages = json.dumps(history, ensure_ascii=False)
-                    row.updated_at = _now()
+                row.messages = json.dumps(history, ensure_ascii=False)
+                row.updated_at = _now()
 
     def publish(self, event: dict) -> bool:
         identity, created = event["id"], event.get("created_at") or _now()

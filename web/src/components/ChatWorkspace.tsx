@@ -282,7 +282,7 @@ export function ChatWorkspace({
           </button>
         </form>
         <div className="composer-note">
-          <span>仅连接模拟银行与模拟订阅</span>
+          <span>所有操作使用模拟账户与产品</span>
           <span>Enter 发送 · Shift + Enter 换行</span>
         </div>
       </div>

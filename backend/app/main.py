@@ -14,16 +14,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .agent import BankingAgent
 from .bank.service import BankError, BankService
 from .billing import BillingError, BillingService, sample_csv
+from .cards import CardService
 from .config import MODEL, ROOT, database_url
 from .conversations import ConversationError, ConversationStore
 from .knowledge.service import KnowledgeService
 from .llm import DeepSeekClient, ModelError
 from .subscriptions import SubscriptionService
+from .wealth import WealthService
 
 logger = logging.getLogger("concierge")
 
@@ -52,7 +54,41 @@ class SubscriptionRequest(BaseModel):
     conversation_id: str
 
 
-def create_app(db_url: str | None = None, model=None, knowledge_dir: Path | None = None) -> FastAPI:
+class CardRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["freeze", "unfreeze", "report_lost", "set_daily_limit", "set_credit_limit", "apply_card"]
+    conversation_id: str
+    card_id: str | None = None
+    amount_minor: int | None = Field(default=None, strict=True)
+    card_kind: Literal["debit", "credit"] | None = None
+
+
+class WealthRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["purchase", "redeem"]
+    conversation_id: str
+    product_id: str | None = None
+    account_id: str | None = None
+    position_id: str | None = None
+    amount_minor: int | None = Field(default=None, strict=True)
+
+
+class RiskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    answers: dict
+
+
+class ClockRequest(BaseModel):
+    business_days: int = Field(ge=1, le=365, strict=True)
+
+
+def create_app(
+    db_url: str | None = None,
+    model=None,
+    knowledge_dir: Path | None = None,
+    *,
+    enable_p3_actions: bool = False,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         url = db_url or database_url()
@@ -64,19 +100,37 @@ def create_app(db_url: str | None = None, model=None, knowledge_dir: Path | None
         billing.seed_demo()
         subscriptions = SubscriptionService(url)
         subscriptions.seed_demo()
+        cards = CardService(url)
+        cards.seed_demo()
+        wealth = WealthService(url)
+        wealth.seed_demo()
         client = model or DeepSeekClient()
         app.state.bank, app.state.knowledge, app.state.store, app.state.model = bank, knowledge, store, client
         app.state.billing, app.state.subscriptions = billing, subscriptions
+        app.state.cards, app.state.wealth = cards, wealth
+        app.state.p3_actions_enabled = enable_p3_actions
         sync_events()
-        app.state.agent = BankingAgent(bank, knowledge, store, client, billing, subscriptions)
+        app.state.agent = BankingAgent(
+            bank,
+            knowledge,
+            store,
+            client,
+            billing,
+            subscriptions,
+            cards,
+            wealth,
+            enable_p3_actions=enable_p3_actions,
+        )
         yield
         await client.close()
         store.close()
         bank.dispose()
         billing.close()
         subscriptions.close()
+        cards.close()
+        wealth.close()
 
-    app = FastAPI(title="银小二 · Banking Concierge", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="银小二 · Banking Concierge", version="0.3.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -105,10 +159,13 @@ def create_app(db_url: str | None = None, model=None, knowledge_dir: Path | None
 
     def sync_events():
         store, subscriptions = app.state.store, app.state.subscriptions
+        app.state.wealth.process_due()
         subscriptions.renewal_notifications(app.state.billing.entries())
         events = app.state.bank.completed_events()
         events += subscriptions.completed_events()
         events += subscriptions.persisted_notifications()
+        events += app.state.cards.completed_events()
+        events += app.state.wealth.completed_events()
         for event in events:
             store.publish(event)
             if event.get("plan_id") and event.get("receipt"):
@@ -117,6 +174,26 @@ def create_app(db_url: str | None = None, model=None, knowledge_dir: Path | None
     def check_scope(plan, identity):
         if identity and plan and plan.get("conversation_id") != identity:
             raise BankError("CONVERSATION_MISMATCH", "这张确认单属于另一条会话，请回到原事项办理。")
+
+    def services():
+        return {
+            "transfer": app.state.bank,
+            "subscription": app.state.subscriptions,
+            "card": app.state.cards,
+            "wealth": app.state.wealth,
+        }
+
+    def invalidate_other_plans(identity, keep):
+        for service in services().values():
+            if service is not keep:
+                service.invalidate_pending_plans(identity)
+
+    def visible_action(action):
+        if not action:
+            return None
+        if action.get("kind") in {"card", "wealth"} and not app.state.p3_actions_enabled:
+            return None
+        return action
 
     @app.get("/api/conversations")
     def conversations():
@@ -139,18 +216,25 @@ def create_app(db_url: str | None = None, model=None, knowledge_dir: Path | None
             action = message.get("action") or message.get("plan")
             if not action:
                 continue
-            subscription = action.get("kind") == "subscription"
-            current = (app.state.subscriptions if subscription else app.state.bank).get_plan(action["id"])
+            kind = action.get("kind", "transfer")
+            service = services().get(kind)
+            current = service.get_plan(action["id"]) if service else None
             if current:
                 message["action"] = (
-                    current if subscription else {**current, "kind": "transfer", "title": "转账确认"}
+                    {**current, "kind": "transfer", "title": "转账确认"} if kind == "transfer" else current
                 )
-                if not subscription:
+                if kind == "transfer":
                     message["plan"] = current
-        bank_plan = app.state.bank.pending_for_conversation(identity)
-        result["pending_action"] = app.state.subscriptions.pending_for_conversation(identity)
-        if bank_plan:
-            result["pending_action"] = {**bank_plan, "kind": "transfer", "title": "转账确认"}
+            message["action"] = visible_action(message.get("action"))
+        pending = []
+        for kind, service in services().items():
+            candidate = service.pending_for_conversation(identity)
+            if candidate and kind == "transfer":
+                candidate = {**candidate, "kind": "transfer", "title": "转账确认"}
+            candidate = visible_action(candidate)
+            if candidate:
+                pending.append(candidate)
+        result["pending_action"] = max(pending, key=lambda item: item["expires_at"]) if pending else None
         return result
 
     @app.post("/api/conversations/{identity}/read")
@@ -199,7 +283,7 @@ def create_app(db_url: str | None = None, model=None, knowledge_dir: Path | None
         conversation_id, history = store.load(request.conversation_id)
         # Validate first; an unsupported request must not replace an existing valid preview.
         action = app.state.subscriptions.create_action_plan(identity, request.action, conversation_id)
-        app.state.bank.invalidate_pending_plans(conversation_id)
+        invalidate_other_plans(conversation_id, app.state.subscriptions)
         prompt = (
             f"请{'取消订阅' if request.action == 'cancel_subscription' else '停止代扣'}：{action['merchant']}"
         )
@@ -210,6 +294,96 @@ def create_app(db_url: str | None = None, model=None, knowledge_dir: Path | None
         store.save(conversation_id, history)
         store.append_assistant(conversation_id, {"reply": action["description"], "action": action})
         return action
+
+    async def preview_domain(identity, service, create):
+        async with app.state.agent.conversation_lock(identity):
+
+            def persist():
+                conversation_id, history = app.state.store.load(identity)
+                action = create()
+                invalidate_other_plans(conversation_id, service)
+                prompt = f"请预览：{action['title']}"
+                app.state.store.append_user(conversation_id, prompt)
+                history.extend(
+                    [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": action["description"]},
+                    ]
+                )
+                app.state.store.save(conversation_id, history)
+                app.state.store.append_assistant(
+                    conversation_id, {"reply": action["description"], "action": action}
+                )
+                return action
+
+            return await asyncio.to_thread(persist)
+
+    def decide_domain(identity, service, request):
+        plan = service.get_plan(identity)
+        check_scope(plan, request.conversation_id)
+        result = service.decide_plan(identity, request.decision)
+        if plan and plan.get("conversation_id"):
+            result["conversation_id"] = plan["conversation_id"]
+        app.state.store.note_decision(identity, result["message"], result)
+        sync_events()
+        return result
+
+    @app.get("/api/cards")
+    def cards_list():
+        return {"cards": app.state.cards.list_cards(), "applications": app.state.cards.list_applications()}
+
+    @app.post("/api/cards/preview")
+    async def cards_preview(request: CardRequest):
+        return await preview_domain(
+            request.conversation_id,
+            app.state.cards,
+            lambda: app.state.cards.create_action_plan(**request.model_dump()),
+        )
+
+    @app.post("/api/card-plans/{identity}/decision")
+    def cards_decision(identity: str, request: DecisionRequest):
+        return decide_domain(identity, app.state.cards, request)
+
+    @app.get("/api/wealth")
+    def wealth_overview():
+        sync_events()
+        return {
+            "products": app.state.wealth.list_products(),
+            "risk_profile": app.state.wealth.get_risk_profile(),
+            "positions": app.state.wealth.list_positions(),
+            "orders": app.state.wealth.list_orders(),
+            "as_of": app.state.wealth.current_date(),
+        }
+
+    @app.get("/api/wealth/orders/{identity}")
+    def wealth_order(identity: str):
+        sync_events()
+        result = app.state.wealth.get_order(identity)
+        if result is None:
+            raise HTTPException(404, detail={"code": "ORDER_NOT_FOUND", "message": "没有找到这笔理财订单。"})
+        return result
+
+    @app.post("/api/wealth/risk-profile")
+    def risk_profile(request: RiskRequest):
+        return app.state.wealth.set_risk_profile(request.answers)
+
+    @app.post("/api/wealth/preview")
+    async def wealth_preview(request: WealthRequest):
+        return await preview_domain(
+            request.conversation_id,
+            app.state.wealth,
+            lambda: app.state.wealth.create_action_plan(**request.model_dump()),
+        )
+
+    @app.post("/api/wealth-plans/{identity}/decision")
+    def wealth_decision(identity: str, request: DecisionRequest):
+        return decide_domain(identity, app.state.wealth, request)
+
+    @app.post("/api/wealth/demo/advance")
+    def advance_clock(request: ClockRequest):
+        result = app.state.wealth.advance_demo_clock(request.business_days)
+        sync_events()
+        return result
 
     @app.post("/api/subscription-plans/{identity}/decision")
     def subscription_decision(identity: str, request: DecisionRequest):
@@ -227,6 +401,7 @@ def create_app(db_url: str | None = None, model=None, knowledge_dir: Path | None
             "model_configured": app.state.model.configured,
             "storage": app.state.bank.dialect_name,
             "knowledge_documents": app.state.knowledge.document_count,
+            "p3_actions_enabled": app.state.p3_actions_enabled,
         }
 
     @app.get("/api/overview")
@@ -324,4 +499,4 @@ def create_app(db_url: str | None = None, model=None, knowledge_dir: Path | None
     return app
 
 
-app = create_app()
+app = create_app(enable_p3_actions=True)

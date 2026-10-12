@@ -104,6 +104,45 @@ TOOLS = [
     tool("list_notifications", "查询已核验转账回执、订阅操作结果及续费提醒。", {}, []),
 ]
 
+P3_TOOLS = [
+    tool("list_cards", "查询模拟卡片状态、尾号、消费和信用额度及申请记录。", {}, []),
+    tool(
+        "create_card_preview",
+        "只创建卡片操作确认单，申请受理不等于获批。",
+        {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "freeze",
+                    "unfreeze",
+                    "report_lost",
+                    "set_daily_limit",
+                    "set_credit_limit",
+                    "apply_card",
+                ],
+            },
+            "card_id": {"type": "string"},
+            "amount_minor": {"type": "integer", "minimum": 1},
+            "card_kind": {"type": "string", "enum": ["debit", "credit"]},
+        },
+        ["action"],
+    ),
+    tool("get_wealth_overview", "查询模拟产品、实际风险档案、持仓和订单；未测评不能申购。", {}, []),
+    tool(
+        "create_wealth_preview",
+        "只生成申购或赎回确认单；先查询风险档案、产品、账户或持仓；不能执行。",
+        {
+            "action": {"type": "string", "enum": ["purchase", "redeem"]},
+            "product_id": {"type": "string"},
+            "account_id": {"type": "string"},
+            "position_id": {"type": "string"},
+            "amount_minor": {"type": "integer", "minimum": 1},
+        },
+        ["action", "amount_minor"],
+    ),
+    tool("cancel_action_preview", "撤销当前会话待确认的操作，不撤销已受理或已完成的订单。", {}, []),
+]
+
 
 class State(TypedDict, total=False):
     conversation_id: str
@@ -125,13 +164,39 @@ class BankingAgent:
         model: DeepSeekClient,
         billing=None,
         subscriptions=None,
+        cards=None,
+        wealth=None,
+        *,
+        enable_p3_actions: bool = False,
     ) -> None:
         self.bank, self.knowledge, self.store, self.model = bank, knowledge, store, model
         self.billing, self.subscriptions = billing, subscriptions
+        self.cards, self.wealth = cards, wealth
+        self.tools = TOOLS + (P3_TOOLS if enable_p3_actions else [])
+        self.system_prompt = SYSTEM.replace(
+            "卡片、理财、支付宝通知接入、鲜花下单目前未实现。",
+            "当前界面尚未开放卡片与理财办理；支付宝通知接入、鲜花下单目前未实现。",
+        )
+        if enable_p3_actions:
+            self.system_prompt = self.system_prompt.replace(
+                "当前界面尚未开放卡片与理财办理；支付宝通知接入、鲜花下单目前未实现。",
+                "卡片支持状态查询、冻结/解锁、挂失、额度变更和申请预览；理财支持产品比较、申购、持仓和赎回预览。支付宝通知接入、鲜花下单目前未实现。",
+            )
+            self.system_prompt += (
+                "\n卡片冻结只限制卡片渠道，不冻结整个账户；挂失卡不能普通解锁，提交申请不等于获批。"
+                "\n申购需已填写完整风险档案且产品风险匹配；缺档案引导用户到理财页面完成五项风险测评，禁止推测用户答案或风险等级。"
+                "\n申购确认后先受理、扣款，T+1结算后才入持仓；赎回先预占份额，T+1到账前不能称现金已到。"
+                "\n所有产品规则与金额通过工具获取，不保证收益；你不能推进模拟时钟或批准任何卡片/理财操作。"
+            )
         self._locks: dict[str, asyncio.Lock] = {}
 
     def conversation_lock(self, identity: str) -> asyncio.Lock:
         return self._locks.setdefault(identity, asyncio.Lock())
+
+    def invalidate_plans(self, identity: str, keep=None):
+        for service in (self.bank, self.subscriptions, self.cards, self.wealth):
+            if service and service is not keep:
+                service.invalidate_pending_plans(identity)
 
     async def chat(self, message: str, conversation_id: str | None = None, emit=None) -> dict:
         conversation_id, history = self.store.load(conversation_id)
@@ -139,9 +204,7 @@ class BankingAgent:
         async with lock:
             # Re-read after waiting, so simultaneous messages cannot overwrite a turn.
             _, history = self.store.load(conversation_id)
-            self.bank.invalidate_pending_plans(conversation_id)
-            if self.subscriptions:
-                self.subscriptions.invalidate_pending_plans(conversation_id)
+            self.invalidate_plans(conversation_id)
             history.append({"role": "user", "content": message})
             self.store.save(conversation_id, history)
             self.store.append_user(conversation_id, message)
@@ -166,7 +229,9 @@ class BankingAgent:
 
             async def call_model(state: State) -> dict:
                 await progress("正在理解你的需求…" if state["steps"] == 0 else "正在整理办理结果…")
-                context = [{"role": "system", "content": SYSTEM}] + _model_history(state["messages"])
+                context = [{"role": "system", "content": self.system_prompt}] + _model_history(
+                    state["messages"]
+                )
                 if initial_sources:
                     context.insert(
                         1,
@@ -178,7 +243,7 @@ class BankingAgent:
                     )
                 # Monetary tool facts are formatted below; avoid streaming an unverified numeric paraphrase.
                 response = await self.model.complete(
-                    context, TOOLS, emit=None if state.get("facts") else emit
+                    context, self.tools, emit=None if state.get("facts") else emit
                 )
                 return {"messages": state["messages"] + [response], "steps": state["steps"] + 1}
 
@@ -225,8 +290,7 @@ class BankingAgent:
                                 arguments["amount_minor"],
                                 conversation_id,
                             )
-                            if self.subscriptions:
-                                self.subscriptions.invalidate_pending_plans(conversation_id)
+                            self.invalidate_plans(conversation_id, keep=self.bank)
                             action = {
                                 **plan,
                                 "kind": "transfer",
@@ -272,9 +336,69 @@ class BankingAgent:
                                 arguments["action"],
                                 conversation_id,
                             )
-                            self.bank.invalidate_pending_plans(conversation_id)
+                            self.invalidate_plans(conversation_id, keep=self.subscriptions)
                             plan = None
                             result = {"action": action, "instruction": "等待用户点击确认，尚未执行。"}
+                        elif name == "list_cards" and self.cards and P3_TOOLS[0] in self.tools:
+                            await progress("正在查询卡片状态…")
+                            result = {
+                                "cards": await asyncio.to_thread(self.cards.list_cards),
+                                "applications": await asyncio.to_thread(self.cards.list_applications),
+                            }
+                            facts["cards"] = result
+                        elif name == "create_card_preview" and self.cards and P3_TOOLS[0] in self.tools:
+                            await progress("正在准备卡片确认单…")
+                            action = await asyncio.to_thread(
+                                self.cards.create_action_plan,
+                                arguments["action"],
+                                conversation_id,
+                                card_id=arguments.get("card_id"),
+                                amount_minor=arguments.get("amount_minor"),
+                                card_kind=arguments.get("card_kind"),
+                            )
+                            self.invalidate_plans(conversation_id, keep=self.cards)
+                            plan = None
+                            result = {"action": action, "instruction": "等待用户确认，卡片状态尚未改变。"}
+                        elif name == "get_wealth_overview" and self.wealth and P3_TOOLS[0] in self.tools:
+                            await progress("正在查询产品和持仓…")
+
+                            def wealth_facts():
+                                self.wealth.process_due()
+                                return {
+                                    "products": self.wealth.list_products(),
+                                    "risk_profile": self.wealth.get_risk_profile(),
+                                    "positions": self.wealth.list_positions(),
+                                    "orders": self.wealth.list_orders()[:20],
+                                    "as_of": self.wealth.current_date(),
+                                }
+
+                            result = await asyncio.to_thread(wealth_facts)
+                            facts["wealth"] = result
+                        elif name == "create_wealth_preview" and self.wealth and P3_TOOLS[0] in self.tools:
+                            await progress("正在准备理财确认单…")
+                            action = await asyncio.to_thread(
+                                self.wealth.create_action_plan,
+                                arguments["action"],
+                                conversation_id,
+                                product_id=arguments.get("product_id"),
+                                account_id=arguments.get("account_id"),
+                                position_id=arguments.get("position_id"),
+                                amount_minor=arguments.get("amount_minor"),
+                            )
+                            self.invalidate_plans(conversation_id, keep=self.wealth)
+                            plan = None
+                            result = {
+                                "action": action,
+                                "instruction": "只生成确认单，没有执行。申购/赎回仍需受理和结算。",
+                            }
+                        elif name == "cancel_action_preview" and P3_TOOLS[0] in self.tools:
+                            self.invalidate_plans(conversation_id)
+                            plan = action = None
+                            result = {
+                                "status": "declined",
+                                "message": "本次待确认操作已撤销，没有执行新操作。",
+                            }
+                            facts["cancelled_preview"] = result["message"]
                         elif name == "list_notifications":
                             result = self.store.notifications()[:20]
                         else:
@@ -287,6 +411,8 @@ class BankingAgent:
                             "error": "INVALID_ARGUMENTS",
                             "message": "工具参数不完整或格式不正确，请核对。",
                         }
+                    if isinstance(result, dict) and result.get("error"):
+                        facts["operation_error"] = result["message"]
                     messages.append(
                         {
                             "role": "tool",
@@ -318,6 +444,57 @@ class BankingAgent:
                     reply = state["action"]["description"] + " 请核对确认单后决定。"
                 elif facts.get("operation_error"):
                     reply = facts["operation_error"]
+                elif facts.get("cancelled_preview"):
+                    reply = facts["cancelled_preview"]
+                elif facts.get("cards"):
+                    labels = {"active": "正常", "frozen": "已冻结", "lost": "已挂失", "closed": "已关闭"}
+                    rows = "\n".join(
+                        f"| {c['name']} · {c['last4']} | {labels[c['status']]} | {_money(c['daily_limit_minor'])} |"
+                        for c in facts["cards"]["cards"]
+                    )
+                    reply = (
+                        f"你的模拟卡片如下：\n\n| 卡片 | 状态 | 单日消费限额 |\n| --- | --- | ---: |\n{rows}"
+                    )
+                    reply += "\n\n冻结仅限制卡片渠道；挂失不能通过普通解锁恢复。卡片申请提交后需等待审核。"
+                elif facts.get("wealth"):
+                    overview = facts["wealth"]
+                    if re.search(r"持仓|持有|份额", message) and not re.search(r"申购|购买", message):
+                        positions = overview["positions"]
+                        rows = "\n".join(
+                            f"| {p['product_name']} | {_money(p['principal_minor'])} | {_money(p['available_minor'])} | {p['unlock_on']} |"
+                            for p in positions
+                        )
+                        reply = (
+                            f"当前模拟持仓：\n\n| 产品 | 本金 | 可用份额本金 | 可赎回日期 |\n| --- | ---: | ---: | --- |\n{rows}"
+                            if positions
+                            else "目前没有已结算的模拟持仓。受理中的申购请查看订单状态。"
+                        )
+                    elif re.search(r"订单|进度|到账|结算", message):
+                        orders = overview["orders"]
+                        rows = "\n".join(
+                            f"| {'申购' if o['action'] == 'purchase' else '赎回'} | {_money(o['amount_minor'])} | {'已结算' if o['status'] == 'settled' else '待结算'} | {o['settles_on']} |"
+                            for o in orders[:8]
+                        )
+                        reply = (
+                            f"当前理财订单：\n\n| 业务 | 本金 | 状态 | 结算日期 |\n| --- | ---: | --- | --- |\n{rows}"
+                            if orders
+                            else "当前没有模拟理财订单。"
+                        )
+                    else:
+                        rows = "\n".join(
+                            f"| {p['name']} | R{p['risk_level']} | {_money(p['min_purchase_minor'])} | {p['lock_days']} 天 | {Decimal(p['purchase_fee_bps']) / 100}% |"
+                            for p in overview["products"]
+                        )
+                        profile = overview["risk_profile"]
+                        reply = (
+                            f"模拟产品规则如下：\n\n| 产品 | 风险等级 | 起购金额 | 锁定期 | 申购费 |\n| --- | --- | ---: | ---: | ---: |\n{rows}\n\n"
+                            + (
+                                f"当前模拟风险档案为 R{profile['risk_level']}，仅可申购不高于该等级的产品。"
+                                if profile
+                                else "你尚未完成五项风险测评，目前不能申购。"
+                            )
+                            + " 申购与赎回按业务日 T+1 结算，受理不等于持仓入账或现金到账。"
+                        )
                 elif facts.get("billing"):
                     report = facts["billing"]
                     rows = "\n".join(

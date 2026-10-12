@@ -11,6 +11,7 @@ import {
   Repeat2,
   UserRound,
   RefreshCw,
+  ChartNoAxesCombined,
 } from "lucide-react";
 import {
   createConversation,
@@ -31,12 +32,16 @@ import { ChatWorkspace } from "./components/ChatWorkspace";
 import { ActionDrawer } from "./components/ActionDrawer";
 import { BillingPage } from "./components/BillingPage";
 import { SubscriptionsPage } from "./components/SubscriptionsPage";
-type View = "chat" | "accounts" | "transactions" | "billing" | "subscriptions";
+import { CardsPage } from "./components/CardsPage";
+import { WealthPage } from "./components/WealthPage";
+type View = "chat" | "accounts" | "transactions" | "billing" | "subscriptions" | "cards" | "wealth";
 const nav = [
   { id: "accounts" as const, label: "账户", icon: CreditCard },
   { id: "transactions" as const, label: "交易", icon: ArrowRightLeft },
   { id: "billing" as const, label: "账单", icon: ReceiptText },
   { id: "subscriptions" as const, label: "订阅", icon: Repeat2 },
+  { id: "cards" as const, label: "卡片", icon: CreditCard },
+  { id: "wealth" as const, label: "理财", icon: ChartNoAxesCombined },
 ];
 function stored(key: string) {
   try {
@@ -80,6 +85,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
   const [decisionBusy, setDecisionBusy] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
   const [creating, setCreating] = useState(false);
   const [revision, setRevision] = useState(0);
   const [renaming, setRenaming] = useState("");
@@ -138,6 +144,7 @@ export default function App() {
       setDrawer(false);
       setChatBusy(false);
       setDecisionBusy(false);
+      setActionBusy(false);
       setError("");
       setView("chat");
       if (window.innerWidth < 760) setCollapsed(true);
@@ -307,6 +314,7 @@ export default function App() {
               title={label}
               onClick={() => {
                 setView(id);
+                setActionBusy(false);
                 if (window.innerWidth < 760) setCollapsed(true);
               }}
             >
@@ -348,7 +356,7 @@ export default function App() {
             <button
               className="icon-button"
               aria-label="刷新当前内容"
-              disabled={chatBusy || decisionBusy}
+              disabled={chatBusy || decisionBusy || actionBusy}
               onClick={refreshCurrent}
             >
               <RefreshCw size={17} />
@@ -392,7 +400,7 @@ export default function App() {
                     if (value) loadVersion.current++;
                     setChatBusy(value);
                   }}
-                  decisionBusy={decisionBusy}
+                  decisionBusy={decisionBusy || actionBusy}
                 />
               </div>
             )}
@@ -402,6 +410,9 @@ export default function App() {
                   {error ? "暂时无法读取会话。" : "正在恢复会话…"}
                 </p>
               )
+            ) : view === "cards" || view === "wealth" ? (
+              view === "cards" ? <CardsPage key={`cards:${activeId}`} conversationId={activeId} revision={revision} blocked={chatBusy || decisionBusy} onBusy={setActionBusy} onAction={(action)=>{if(action.conversation_id!==activeRef.current)return;acceptAction(action);void loadConversation(activeId);}} />
+              : <WealthPage key={`wealth:${activeId}`} conversationId={activeId} revision={revision} accounts={overview?.accounts??[]} blocked={chatBusy || decisionBusy} onBusy={setActionBusy} onRefresh={refreshCurrent} onAction={(action)=>{if(action.conversation_id!==activeRef.current)return;acceptAction(action);void loadConversation(activeId);}} />
             ) : view === "billing" ? (
               <BillingPage revision={revision} />
             ) : view === "subscriptions" ? (
@@ -434,7 +445,7 @@ export default function App() {
               action={pending}
               accounts={overview?.accounts ?? []}
               conversationId={activeId}
-              chatBusy={chatBusy}
+              chatBusy={chatBusy || actionBusy}
               onClose={closeDrawer}
               onBusy={setDecisionBusy}
               onDone={() => {

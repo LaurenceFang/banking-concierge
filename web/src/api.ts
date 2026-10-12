@@ -9,6 +9,7 @@ import type {
   SubscriptionAction,
   SubscriptionList,
   Action,
+  CardAction, CardList, WealthAction, WealthOverview, WealthOrder, RiskAnswers, RiskProfile,
 } from "./types";
 
 export class ApiError extends Error {
@@ -224,7 +225,7 @@ export const decideAction = (
   action.kind === "transfer"
     ? decidePlan(action.id, decision, conversationId)
     : request<DecisionResponse>(
-        `/subscription-plans/${encodeURIComponent(action.id)}/decision`,
+        `/${action.kind === "card" ? "card" : action.kind === "wealth" ? "wealth" : "subscription"}-plans/${encodeURIComponent(action.id)}/decision`,
         {
           method: "POST",
           body: JSON.stringify({ decision, conversation_id: conversationId }),
@@ -237,6 +238,20 @@ export const money = (minor: number, currency = "CNY") =>
     currency,
     minimumFractionDigits: 2,
   }).format(minor / 100);
+// Decimal text is converted through integer arithmetic; never round excess decimals.
+export function parseMinor(text: string): number {
+  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text.trim());
+  if (!match) throw new Error("请输入有效金额，最多两位小数。");
+  const value = BigInt(match[1]) * 100n + BigInt((match[2] ?? "").padEnd(2, "0"));
+  if (value <= 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("金额须大于零且在支持范围内。");
+  return Number(value);
+}
+export const getCards = () => request<CardList>("/cards");
+export const previewCard = (input: {action: CardAction["action"]; conversation_id: string; card_id?: string; amount_minor?: number; card_kind?: "debit" | "credit"}) => request<CardAction>("/cards/preview", {method:"POST",body:JSON.stringify(input)});
+export const getWealth = () => request<WealthOverview>("/wealth");
+export const saveRiskProfile = (answers: RiskAnswers) => request<RiskProfile>("/wealth/risk-profile", {method:"POST",body:JSON.stringify({answers})});
+export const previewWealth = (input: {action: WealthAction["action"]; conversation_id: string; product_id?: string; account_id?: string; position_id?: string; amount_minor: number}) => request<WealthAction>("/wealth/preview", {method:"POST",body:JSON.stringify(input)});
+export const advanceWealthDay = () => request<{as_of:string; settled_orders: WealthOrder[]}>("/wealth/demo/advance", {method:"POST",body:JSON.stringify({business_days:1})});
 export const timestamp = (value: string) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime())

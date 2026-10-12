@@ -49,6 +49,8 @@ export interface DecisionResponse {
   status: "completed" | "declined";
   message: string;
   operation_id?: string;
+  order_id?: string;
+  order_status?: "pending_settlement" | "settled";
 }
 export interface ChatMessage {
   id: string;
@@ -69,7 +71,7 @@ export interface Conversation {
 }
 export type Action =
   | (Plan & { kind: "transfer"; title: string; conversation_id?: string })
-  | SubscriptionAction;
+  | SubscriptionAction | CardAction | WealthAction;
 export interface SubscriptionAction {
   id: string;
   kind: "subscription";
@@ -156,4 +158,53 @@ export interface Candidate {
 export interface SubscriptionList {
   subscriptions: Subscription[];
   candidates: Candidate[];
+}
+export interface Card {
+  id: string; name: string; kind: "debit" | "credit"; last4: string;
+  account_id: string | null; status: "active" | "frozen" | "lost" | "closed";
+  daily_limit_minor: number; credit_limit_minor: number | null;
+  outstanding_minor: number; available_credit_minor: number | null; currency: string;
+}
+export interface CardList {
+  cards: Card[];
+  applications: { id: string; card_kind: "debit" | "credit"; status: "submitted"; submitted_at: string }[];
+}
+interface DomainAction {
+  id: string; title: string; description: string; status: string; expires_at: string; conversation_id: string;
+}
+export interface CardAction extends DomainAction {
+  kind: "card"; action: "freeze" | "unfreeze" | "report_lost" | "set_daily_limit" | "set_credit_limit" | "apply_card";
+  card_id: string | null; card_name: string | null; card_kind: string | null; amount_minor: number | null;
+  before: Record<string, unknown>; after: Record<string, unknown>;
+}
+export interface RiskAnswers {
+  horizon: "short" | "medium" | "long";
+  loss_tolerance: "none" | "low" | "moderate" | "high";
+  experience: "none" | "basic" | "experienced";
+  liquidity_need: "high" | "medium" | "low";
+  objective: "preserve" | "balanced" | "growth";
+}
+export interface RiskProfile { answers: RiskAnswers; risk_level: number; risk_label: string; assessed_at: string; explanation: string }
+export interface WealthProduct {
+  id: string; name: string; risk_level: number; min_purchase_minor: number;
+  purchase_fee_bps: number; redemption_fee_bps: number; lock_days: number;
+  settlement_business_days: number; eligible: boolean; description: string;
+}
+export interface WealthPosition {
+  id: string; product_id: string; product_name: string; principal_minor: number;
+  available_minor: number; redemption_pending_minor: number; unlock_on: string; risk_level: number;
+}
+export interface WealthOrder {
+  id: string; action: "purchase" | "redeem"; product_id: string; amount_minor: number;
+  fee_minor: number; total_minor: number; payout_minor: number;
+  status: "pending_settlement" | "settled"; requested_on: string; settles_on: string;
+}
+export interface WealthOverview {
+  products: WealthProduct[]; risk_profile: RiskProfile | null;
+  positions: WealthPosition[]; orders: WealthOrder[]; as_of: string;
+}
+export interface WealthAction extends DomainAction {
+  kind: "wealth"; action: "purchase" | "redeem"; product_id: string; product_name: string;
+  account_id: string; position_id: string | null; amount_minor: number; fee_minor: number;
+  total_minor: number; payout_minor: number; settles_on: string; risk_level: number;
 }
