@@ -5,17 +5,17 @@ import type { Action, Card, CardAction } from "../types";
 import { useDomainPage } from "./useDomainPage";
 
 export const cardStatus: Record<string, string> = {active:"正常", frozen:"已冻结", lost:"已挂失", closed:"已关闭"};
-export function CardsPage({ conversationId, revision, blocked, onAction, onBusy }: {
-  conversationId:string; revision:number; blocked:boolean; onAction:(action:Action)=>void; onBusy:(busy:boolean)=>void;
+export function CardsPage({ conversationId, ensureConversation, revision, blocked, onAction, onBusy }: {
+  conversationId:string; ensureConversation:()=>Promise<string>; revision:number; blocked:boolean; onAction:(action:Action)=>void; onBusy:(busy:boolean)=>void;
 }) {
   const {data,error,busy,run,alive} = useDomainPage(getCards,revision,onBusy);
   const [edit,setEdit] = useState<{card:Card; action:"set_daily_limit"|"set_credit_limit"}|null>(null);
   const [amount,setAmount] = useState("");
-  const disabled = busy || blocked || !conversationId || !data;
+  const disabled = busy || blocked || !data;
   function preview(action:CardAction["action"], card?:Card, cardKind?:"debit"|"credit") {
     if(disabled) return;
     void run(async()=>{
-      const result = await previewCard({action,conversation_id:conversationId,...(card?{card_id:card.id}:{}),...(cardKind?{card_kind:cardKind}:{}),...(action.startsWith("set_")?{amount_minor:parseMinor(amount)}:{})});
+      const result = await previewCard({action,conversation_id:await ensureConversation(),...(card?{card_id:card.id}:{}),...(cardKind?{card_kind:cardKind}:{}),...(action.startsWith("set_")?{amount_minor:parseMinor(amount)}:{})});
       if(alive.current) {setEdit(null);onAction(result);}
     });
   }

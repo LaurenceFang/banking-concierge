@@ -7,7 +7,7 @@ from threading import Event
 
 import pytest
 from app.agent import _humanize
-from app.conversations import MAIN_ID, Conversation, ConversationStore
+from app.conversations import MAIN_ID, ClientRequestReceipt, Conversation, ConversationStore
 from app.main import create_app
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -25,6 +25,85 @@ def client(tmp_path):
 
 def new_thread(client):
     return client.post("/api/conversations", json={}).json()["id"]
+
+
+def test_first_scoped_send_is_idempotent_and_appears_in_both_lists_after_restart(tmp_path):
+    class CountingModel(ScriptedModel):
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, messages, tools, emit=None):
+            self.calls += 1
+            return await super().complete(messages, tools, emit)
+
+    url = f"sqlite:///{(tmp_path / 'scoped-idempotent.sqlite').as_posix()}"
+    model = CountingModel()
+    request = {
+        "message": "给陈晨转账500元",
+        "scope": "bills/entries",
+        "client_request_id": "first-send-20261013-001",
+    }
+    with TestClient(create_app(url, model=model)) as client:
+        first = client.post("/api/chat", json=request)
+        assert first.status_code == 200
+        result = first.json()
+        calls_after_first = model.calls
+        retry = client.post("/api/chat", json=request)
+        assert retry.status_code == 200
+        assert retry.json() == result
+        assert model.calls == calls_after_first
+        conversation_id = result["conversation_id"]
+        detail = client.get(f"/api/conversations/{conversation_id}").json()
+        assert [message["role"] for message in detail["messages"]] == ["user", "assistant"]
+        assert detail["conversation"]["scopes"] == ["bills/entries", "bills/payments"]
+        assert client.get("/api/conversations?scope=bills/entries").json()["conversations"][0]["kind"] == "main"
+        payments = client.get("/api/conversations?scope=bills/payments").json()["conversations"]
+        assert sum(item["id"] == conversation_id for item in payments) == 1
+        cards = client.get("/api/conversations?scope=accounts/cards").json()["conversations"]
+        assert not any(item["id"] == conversation_id for item in cards)
+
+    with TestClient(create_app(url, model=ScriptedModel())) as client:
+        global_items = client.get("/api/conversations").json()["conversations"]
+        assert sum(item["id"] == conversation_id for item in global_items) == 1
+        scoped_items = client.get("/api/conversations?scope=bills/payments").json()["conversations"]
+        assert sum(item["id"] == conversation_id for item in scoped_items) == 1
+        assert client.get(f"/api/conversations/{conversation_id}").json()["conversation"]["scopes"] == [
+            "bills/entries",
+            "bills/payments",
+        ]
+
+
+def test_conflicting_request_id_does_not_poison_the_original_processing_receipt(client):
+    identity = "conflicting-request-001"
+    started = client.app.state.store.start_chat_turn(
+        "原始请求", scope="bills/entries", client_request_id=identity
+    )
+    response = client.post(
+        "/api/chat",
+        json={"message": "另一条消息", "scope": "bills/entries", "client_request_id": identity},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "REQUEST_ID_REUSED"
+    with Session(client.app.state.store.engine) as session:
+        receipt = session.get(ClientRequestReceipt, identity)
+        assert receipt.status == "processing"
+        assert receipt.conversation_id == started["conversation_id"]
+
+
+def test_explicit_domain_conversation_creation_is_scoped_and_idempotent(client):
+    payload = {
+        "title": "卡片设置",
+        "scope": "accounts/cards",
+        "client_request_id": "card-preview-conversation-001",
+    }
+    first = client.post("/api/conversations", json=payload)
+    retry = client.post("/api/conversations", json=payload)
+    assert first.status_code == retry.status_code == 200
+    assert first.json() == retry.json()
+    assert first.json()["kind"] == "temporary"
+    assert first.json()["scopes"] == ["accounts/cards"]
+    items = client.get("/api/conversations?scope=accounts/cards").json()["conversations"]
+    assert sum(item["id"] == first.json()["id"] for item in items) == 1
 
 
 def test_main_unique_and_history_rename_restore(tmp_path):
@@ -77,7 +156,7 @@ def test_transfer_other_thread_does_not_invalidate_and_wrong_scope_rejected(clie
     assert all(n["read"] for n in client.get("/api/notifications").json()["notifications"])
 
 
-def test_subscription_preview_persists_decline_and_new_message_invalidates(client):
+def test_subscription_preview_persists_decline_and_readonly_message_keeps_other_preview(client):
     identity = new_thread(client)
     before = client.get("/api/subscriptions").json()["subscriptions"]
     action = client.post(
@@ -98,12 +177,13 @@ def test_subscription_preview_persists_decline_and_new_message_invalidates(clien
         json={"action": "stop_autopay", "conversation_id": identity},
     ).json()
     client.post("/api/chat", json={"message": "查一下余额", "conversation_id": identity})
-    assert client.get(f"/api/conversations/{identity}").json()["pending_action"] is None
+    assert client.get(f"/api/conversations/{identity}").json()["pending_action"]["id"] == action["id"]
     assert (
         client.post(
-            f"/api/subscription-plans/{action['id']}/decision", json={"decision": "approve"}
-        ).status_code
-        == 409
+            f"/api/subscription-plans/{action['id']}/decision",
+            json={"decision": "decline", "conversation_id": identity},
+        ).json()["status"]
+        == "declined"
     )
 
 

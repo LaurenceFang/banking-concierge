@@ -15,6 +15,7 @@ interface Props {
   refresh: () => void;
   expanded?: boolean;
   transactionsOnly?: boolean;
+  accountsOnly?: boolean;
 }
 
 export function AccountOverview({
@@ -23,7 +24,7 @@ export function AccountOverview({
   error,
   refresh,
   expanded = false,
-  transactionsOnly = false,
+  transactionsOnly = false, accountsOnly = false,
 }: Props) {
   return (
     <div className={`account-content ${expanded ? "expanded" : ""}`}>
@@ -77,7 +78,7 @@ export function AccountOverview({
           )}
         </section>
       )}
-      <section
+      {!accountsOnly && <section
         className="transactions-section"
         aria-labelledby="transactions-heading"
       >
@@ -130,7 +131,7 @@ export function AccountOverview({
         {!overview && !loading && !error && (
           <p className="muted empty-list">暂无交易记录。</p>
         )}
-      </section>
+      </section>}
     </div>
   );
 }

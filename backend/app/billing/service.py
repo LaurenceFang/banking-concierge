@@ -797,10 +797,18 @@ def _classify_category(merchant: str, kind: str, supplied: str = "") -> tuple[st
 def _bank_entry(transaction: LedgerTransaction, account: Account) -> dict[str, Any]:
     raw_description = transaction.description
     merchant_raw = raw_description.split("·", 1)[0].strip() or raw_description
+    merchant_payment = raw_description.startswith("模拟商户消费·")
+    merchant_refund = raw_description.startswith("模拟商户退款·")
+    if merchant_payment or merchant_refund:
+        merchant_raw = raw_description.split("·", 1)[1]
     merchant, alias_used = _normalize_merchant(merchant_raw)
     folded = raw_description.casefold()
     wealth_fee = raw_description.startswith(("理财申购手续费", "理财赎回手续费"))
-    if wealth_fee:
+    if merchant_payment:
+        kind = "expense"
+    elif merchant_refund:
+        kind = "refund"
+    elif wealth_fee:
         kind = "expense"
     elif "期初" in folded or transaction.id.casefold().endswith("-open"):
         kind = "opening"

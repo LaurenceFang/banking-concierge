@@ -56,9 +56,7 @@ class Recipient(Base):
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     bank_name: Mapped[str] = mapped_column(String(120), nullable=False)
     account_last4: Mapped[str] = mapped_column(String(4), nullable=False)
-    destination_account_id: Mapped[str] = mapped_column(
-        ForeignKey("bank_accounts.id"), nullable=False
-    )
+    destination_account_id: Mapped[str] = mapped_column(ForeignKey("bank_accounts.id"), nullable=False)
 
 
 class LedgerTransaction(Base):
@@ -106,3 +104,19 @@ class TransferPlan(Base):
     outcome_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     operation_id: Mapped[str | None] = mapped_column(String(80), nullable=True, unique=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class FundHold(Base):
+    __tablename__ = "bank_fund_holds"
+    __table_args__ = (
+        CheckConstraint("amount_minor > 0", name="ck_hold_positive_amount"),
+        CheckConstraint("remaining_minor >= 0 AND remaining_minor <= amount_minor", name="ck_hold_remaining"),
+        Index("ix_hold_account_status", "account_id", "status"),
+    )
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("bank_accounts.id"), nullable=False)
+    reference: Mapped[str] = mapped_column(String(160), unique=True, nullable=False)
+    amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    remaining_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

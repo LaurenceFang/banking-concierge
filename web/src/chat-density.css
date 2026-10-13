@@ -1,0 +1,80 @@
+/* One reading column shared by messages and composer, including full chat. */
+.app-header.chat-page-header {
+  height: 52px; padding: 8px 28px; border-bottom: 1px solid #dce2d8;
+}
+.chat-page-header h1 {
+  font-size: 16px; font-weight: 400; color: #535c50;
+  max-width: min(520px, 55vw); text-overflow: clip;
+}
+.chat-page-header h1 .conversation-title { display: block; overflow: hidden; white-space: nowrap; }
+.chat-page-header .header-tools { font-size: 12px; }
+.chat-panel .chat-workspace { --reading-width: 680px; }
+.chat-panel .chat-scroll,
+.chat-panel.full-chat .chat-scroll { padding: 26px 24px 12px; }
+.chat-panel .chat-scroll > [role="log"],
+.chat-panel .empty-conversation { width: 100%; max-width: var(--reading-width); margin-inline: auto; }
+.chat-panel .composer-area,
+.chat-panel.full-chat .composer-area {
+  box-sizing: border-box;
+  width: min(100%, calc(var(--reading-width) + 48px));
+  align-self: center;
+  padding: 10px 24px 14px;
+}
+.chat-panel .message { position: relative; margin-bottom: 18px; gap: 0; }
+.chat-panel .message-content { max-width: 100%; }
+.chat-panel .message-bubble,
+.chat-panel .markdown,
+.chat-panel.full-chat .message-bubble,
+.chat-panel.full-chat .markdown { font-size: 14.5px; line-height: 1.42; color: #30362e; }
+.chat-panel .markdown p { margin-bottom: 6px; }
+.chat-panel .markdown p:last-child { margin-bottom: 0; }
+.chat-panel .markdown :is(h1,h2,h3) { font-size: 14.5px; margin: 9px 0 5px; }
+.chat-panel .markdown table { font-size: 14.5px; }
+.chat-panel .message.user { margin-left: 0; }
+.chat-panel .message.user { margin-bottom: 14px; }
+.chat-panel .message.assistant { margin-bottom: 24px; }
+.chat-panel .message.assistant:has(+ .message.user) {
+  border-bottom: 1px solid #dce2d8;
+  padding-bottom: 18px;
+}
+.chat-panel .message.user .message-content { max-width: 85%; }
+.chat-panel .message.user .message-bubble {
+  padding: 10px 14px; border-radius: 15px;
+  background: #4c5449; color: #ffffff;
+}
+.chat-panel .message.assistant .message-bubble { background: none; padding: 0; border: 0; box-shadow: none; }
+.chat-panel .message.assistant .markdown { color: #1f251d; }
+.chat-panel .message.assistant .markdown blockquote { color: #414b3b; }
+.chat-panel .message .message-time {
+  position: absolute; left: 0; top: -18px; margin: 0;
+  font-size: 11px; line-height: 16px; opacity: 0;
+  pointer-events: none; transition: opacity 120ms ease;
+}
+.chat-panel .message.user .message-time { left: auto; right: 0; }
+.chat-panel .message:hover .message-time,
+.chat-panel .message:focus-within .message-time { opacity: 1; }
+.chat-panel .message:focus-visible { outline: 1px solid var(--line); outline-offset: 5px; border-radius: 4px; }
+.chat-panel .message.notification { padding: 0 0 9px; margin-bottom: 17px; }
+.chat-panel .sources { margin-top: 6px; }
+.chat-panel .action-link { margin-top: 5px; }
+.chat-panel .receipt { margin-top: 5px; padding: 3px 0; border: 0; font-size: 13px; }
+.chat-panel .receipt p { margin: 0 0 3px; }
+.receipt-details { color: var(--muted); font-size: 12px; }
+.receipt-details summary { cursor: pointer; width: fit-content; }
+.receipt-details small { display: block; padding-top: 4px; overflow-wrap: anywhere; }
+.chat-panel .composer textarea,
+.chat-panel.full-chat .composer textarea { font-size: 14.5px; line-height: 1.42; color: #30362e; }
+.chat-panel .composer-note { font-size: 11px; }
+.chat-panel .markdown :is(ul,ol) { margin: 6px 0; padding-left: 22px; }
+.chat-panel .markdown li + li { margin-top: 3px; }
+.chat-panel .markdown blockquote { margin: 10px 0; padding: 2px 12px; border-left: 2px solid #d5dcd0; color: #586251; }
+.chat-panel .composer { border-color: #dce1d7; border-radius: 14px; box-shadow: 0 2px 10px #39442f05; }
+@media (max-width: 760px) {
+  .chat-panel .chat-scroll,
+  .chat-panel.full-chat .chat-scroll { padding: 24px 16px 10px; }
+  .chat-panel .composer-area,
+  .chat-panel.full-chat .composer-area { padding: 8px 16px 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-panel .message .message-time { transition: none; }
+}

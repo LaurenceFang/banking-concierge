@@ -63,6 +63,7 @@ export interface ChatMessage {
   receipt?: DecisionResponse | null;
 }
 export interface Conversation {
+  scopes?: string[];
   id: string;
   title: string;
   kind: "main" | "temporary";

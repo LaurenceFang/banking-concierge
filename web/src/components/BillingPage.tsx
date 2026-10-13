@@ -13,7 +13,7 @@ const kindNames: Record<string, string> = {
   transfer: "转账",
   opening: "期初",
 };
-export function BillingPage({ revision }: { revision: number }) {
+export function BillingPage({ revision, mode = "analysis" }: { revision: number; mode?: "entries"|"analysis"|"import" }) {
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [report, setReport] = useState<BillingReport | null>(null);
@@ -69,8 +69,8 @@ export function BillingPage({ revision }: { revision: number }) {
   return (
     <section className="data-page" aria-label="账单分析">
       <div className="page-intro">
-        <h2>看看钱花在哪里</h2>
-        <p>分类与周期来自账单规则，异常仅供复核。</p>
+        <h2>{mode === "entries" ? "收支明细" : mode === "import" ? "导入整理" : "分析与预算"}</h2>
+        <p>{mode === "entries" ? "每一笔收支，清楚可查。" : mode === "import" ? "导入 CSV 账单，整理分类与重复记录。" : "分类与周期来自账单规则，异常仅供复核；暂不支持设置预算。"}</p>
       </div>
       <form
         className="filter-bar"
@@ -100,7 +100,7 @@ export function BillingPage({ revision }: { revision: number }) {
         <button className="button secondary" disabled={busy}>
           查询
         </button>
-        <label className="button secondary file-button">
+        {mode === "import" && <><label className="button secondary file-button">
           {importing ? "正在导入…" : "导入 CSV"}
           <input
             type="file"
@@ -115,7 +115,7 @@ export function BillingPage({ revision }: { revision: number }) {
         </label>
         <a className="text-button" href="/api/billing/sample" download>
           下载示例
-        </a>
+        </a></>}
       </form>
       {error && (
         <p className="inline-error" role="alert">
@@ -142,13 +142,8 @@ export function BillingPage({ revision }: { revision: number }) {
       )}
       {report && (
         <>
-          <p className="source-notice">
-            {report.source_notice}
-            <br />
-            当前数据覆盖 {report.coverage_start ?? "—"} 至{" "}
-            {report.coverage_end ?? "—"}，共 {report.entry_count} 笔。
-          </p>
-          <div className="metric-row">
+          <details className="source-notice"><summary>共 {report.entry_count} 笔 · {report.coverage_start ?? "—"} 至 {report.coverage_end ?? "—"} · 数据说明</summary><p>{report.source_notice}</p></details>
+          {mode === "analysis" && <><div className="metric-row">
             {[
               ["净消费", report.net_expense_minor],
               ["消费扣款", report.expense_minor],
@@ -201,7 +196,8 @@ export function BillingPage({ revision }: { revision: number }) {
               )}
             </section>
           </div>
-          <h3>账单明细</h3>
+          </>}
+          <h3>{mode === "import" ? "已整理记录" : "账单明细"}</h3>
           <div className="table-scroll">
             <table>
               <thead>
@@ -210,11 +206,11 @@ export function BillingPage({ revision }: { revision: number }) {
                   <th>商户</th>
                   <th>分类 / 类型</th>
                   <th>金额</th>
-                  <th>规则依据</th>
+                  {mode !== "entries" && <th>规则依据</th>}
                 </tr>
               </thead>
               <tbody>
-                {report.entries.map((entry) => (
+                {report.entries.slice().sort((a,b)=>b.date.localeCompare(a.date)).map((entry) => (
                   <tr key={entry.id}>
                     <td>
                       {entry.date}
@@ -222,6 +218,7 @@ export function BillingPage({ revision }: { revision: number }) {
                     </td>
                     <td>
                       {entry.merchant}
+                      {mode === "entries" && <details className="small muted"><summary>分类依据</summary><p>{entry.reason}</p></details>}
                       {entry.raw_merchant !== entry.merchant && (
                         <small>原始：{entry.raw_merchant}</small>
                       )}
@@ -236,7 +233,7 @@ export function BillingPage({ revision }: { revision: number }) {
                     <td className={entry.amount_minor > 0 ? "positive" : ""}>
                       {money(entry.amount_minor, entry.currency)}
                     </td>
-                    <td>{entry.reason}</td>
+                    {mode !== "entries" && <td>{entry.reason}</td>}
                   </tr>
                 ))}
               </tbody>

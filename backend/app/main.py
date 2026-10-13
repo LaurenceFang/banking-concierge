@@ -7,6 +7,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import RLock
 from typing import Literal
 from uuid import UUID
 
@@ -25,7 +26,11 @@ from .conversations import ConversationError, ConversationStore
 from .knowledge.service import KnowledgeService
 from .llm import DeepSeekClient, ModelError
 from .subscriptions import SubscriptionService
+from .task_clock import TaskClock
+from .task_routes import task_router
+from .tasks import TasksService
 from .wealth import WealthService
+from .workflows import WorkflowService
 
 logger = logging.getLogger("concierge")
 
@@ -33,6 +38,9 @@ logger = logging.getLogger("concierge")
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     conversation_id: str | None = None
+    scope: str | None = Field(default=None, min_length=1, max_length=80)
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=160)
+    retry_failed: bool = False
 
 
 class DecisionRequest(BaseModel):
@@ -42,6 +50,8 @@ class DecisionRequest(BaseModel):
 
 class ThreadRequest(BaseModel):
     title: str = Field(default="临时事项", max_length=80)
+    scope: str | None = Field(default=None, min_length=1, max_length=80)
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=160)
 
 
 class ImportRequest(BaseModel):
@@ -88,6 +98,9 @@ def create_app(
     knowledge_dir: Path | None = None,
     *,
     enable_p3_actions: bool = False,
+    enable_tasks_actions: bool = False,
+    task_poll_seconds: float = 2.0,
+    workflow_fault_mode: str | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -104,11 +117,26 @@ def create_app(
         cards.seed_demo()
         wealth = WealthService(url)
         wealth.seed_demo()
+        if enable_tasks_actions:
+            task_clock = TaskClock(url)
+            tasks = TasksService(url)
+            tasks.seed_demo()
+            workflows = WorkflowService(url, fault_mode=workflow_fault_mode)
+            workflows.seed_demo()
+        else:
+            task_clock = tasks = workflows = None
         client = model or DeepSeekClient()
         app.state.bank, app.state.knowledge, app.state.store, app.state.model = bank, knowledge, store, client
         app.state.billing, app.state.subscriptions = billing, subscriptions
         app.state.cards, app.state.wealth = cards, wealth
         app.state.p3_actions_enabled = enable_p3_actions
+        app.state.tasks, app.state.workflows, app.state.task_clock = tasks, workflows, task_clock
+        app.state.tasks_actions_enabled = enable_tasks_actions
+        app.state.sync_events = sync_events
+        app.state.task_tick = task_tick
+        app.state.task_tick_lock = RLock()
+        if enable_tasks_actions:
+            task_tick()
         sync_events()
         app.state.agent = BankingAgent(
             bank,
@@ -121,7 +149,24 @@ def create_app(
             wealth,
             enable_p3_actions=enable_p3_actions,
         )
-        yield
+        stop = asyncio.Event()
+        async def background():
+            while not stop.is_set():
+                try:
+                    await asyncio.to_thread(task_tick)
+                except Exception:
+                    logger.exception("Background task processing failed; durable tasks remain recoverable")
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=max(0.02, task_poll_seconds))
+                except TimeoutError:
+                    pass
+        worker = asyncio.create_task(background()) if enable_tasks_actions else None
+        try:
+            yield
+        finally:
+            if worker:
+                stop.set()
+                await worker
         await client.close()
         store.close()
         bank.dispose()
@@ -129,6 +174,10 @@ def create_app(
         subscriptions.close()
         cards.close()
         wealth.close()
+        if tasks:
+            tasks.close()
+            workflows.close()
+            task_clock.close()
 
     app = FastAPI(title="银小二 · Banking Concierge", version="0.3.0", lifespan=lifespan)
     app.add_middleware(
@@ -152,8 +201,16 @@ def create_app(
 
     @app.exception_handler(ConversationError)
     async def conversation_error(_, error):
+        if error.code == "EMPTY_TITLE" or error.code == "INVALID_SCOPE":
+            status_code = 422
+        elif error.code in {"CONVERSATION_NOT_FOUND"}:
+            status_code = 404
+        elif error.code in {"PROVIDER_TIMEOUT", "PROVIDER_UNAVAILABLE", "PROVIDER_ERROR"}:
+            status_code = 503
+        else:
+            status_code = 409
         return JSONResponse(
-            status_code=422 if error.code == "EMPTY_TITLE" else 404,
+            status_code=status_code,
             content={"detail": {"code": error.code, "message": error.message}},
         )
 
@@ -166,22 +223,39 @@ def create_app(
         events += subscriptions.persisted_notifications()
         events += app.state.cards.completed_events()
         events += app.state.wealth.completed_events()
+        if app.state.tasks_actions_enabled:
+            events += app.state.tasks.completed_events()
+            events += app.state.workflows.completed_events()
         for event in events:
             store.publish(event)
             if event.get("plan_id") and event.get("receipt"):
                 store.note_decision(event["plan_id"], event["text"], event["receipt"])
+                for related in event.get("related_plan_ids", []):
+                    if related != event["plan_id"]:
+                        store.note_decision(related, event["text"], event["receipt"])
+
+    def task_tick():
+        if not app.state.tasks_actions_enabled:
+            return
+        with app.state.task_tick_lock:
+            app.state.tasks.process_due()
+            app.state.workflows.process_due()
+            sync_events()
 
     def check_scope(plan, identity):
         if identity and plan and plan.get("conversation_id") != identity:
             raise BankError("CONVERSATION_MISMATCH", "这张确认单属于另一条会话，请回到原事项办理。")
 
     def services():
-        return {
+        result = {
             "transfer": app.state.bank,
             "subscription": app.state.subscriptions,
             "card": app.state.cards,
             "wealth": app.state.wealth,
         }
+        if app.state.tasks_actions_enabled:
+            result.update({"task": app.state.tasks, "workflow": app.state.workflows})
+        return result
 
     def invalidate_other_plans(identity, keep):
         for service in services().values():
@@ -193,16 +267,22 @@ def create_app(
             return None
         if action.get("kind") in {"card", "wealth"} and not app.state.p3_actions_enabled:
             return None
+        if action.get("kind") in {"task", "workflow"} and not app.state.tasks_actions_enabled:
+            return None
         return action
 
     @app.get("/api/conversations")
-    def conversations():
+    def conversations(scope: str | None = None):
         sync_events()
-        return {"conversations": app.state.store.list()}
+        return {"conversations": app.state.store.list(scope)}
 
     @app.post("/api/conversations")
     def create_conversation(request: ThreadRequest):
-        return app.state.store.create(request.title)
+        return app.state.store.create(
+            request.title,
+            scope=request.scope,
+            client_request_id=request.client_request_id,
+        )
 
     @app.patch("/api/conversations/{identity}")
     def rename_conversation(identity: str, request: ThreadRequest):
@@ -328,6 +408,9 @@ def create_app(
         sync_events()
         return result
 
+    if enable_tasks_actions:
+        app.include_router(task_router(app, preview_domain, decide_domain))
+
     @app.get("/api/cards")
     def cards_list():
         return {"cards": app.state.cards.list_cards(), "applications": app.state.cards.list_applications()}
@@ -402,6 +485,7 @@ def create_app(
             "storage": app.state.bank.dialect_name,
             "knowledge_documents": app.state.knowledge.document_count,
             "p3_actions_enabled": app.state.p3_actions_enabled,
+            "tasks_actions_enabled": app.state.tasks_actions_enabled,
         }
 
     @app.get("/api/overview")
@@ -412,6 +496,7 @@ def create_app(
         message = request.message.strip()
         if not message:
             raise HTTPException(422, detail={"code": "EMPTY_MESSAGE", "message": "请先输入你的需求。"})
+        app.state.store.validate_scope(request.scope)
         if request.conversation_id:
             try:
                 UUID(request.conversation_id)
@@ -422,11 +507,37 @@ def create_app(
             app.state.store.load(request.conversation_id)
         return message
 
+    async def run_chat(request: ChatRequest, message: str, emit=None) -> dict:
+        try:
+            return await app.state.agent.chat(
+                message,
+                request.conversation_id,
+                emit=emit,
+                scope=request.scope,
+                client_request_id=request.client_request_id,
+                retry_failed=request.retry_failed,
+            )
+        except ModelError as error:
+            app.state.store.fail_chat_request(request.client_request_id, error.code, error.message)
+            raise
+        except ConversationError:
+            raise
+        except asyncio.CancelledError:
+            app.state.store.fail_chat_request(
+                request.client_request_id, "REQUEST_INTERRUPTED", "这次回复中断了；对话和已发送消息已保存。"
+            )
+            raise
+        except Exception:
+            app.state.store.fail_chat_request(
+                request.client_request_id, "INTERNAL_ERROR", "请求暂时未完成；对话和已发送消息已保存。"
+            )
+            raise
+
     @app.post("/api/chat")
     async def chat(request: ChatRequest):
         message = validate_request(request)
         try:
-            return await app.state.agent.chat(message, request.conversation_id)
+            return await run_chat(request, message)
         except ModelError as error:
             raise HTTPException(503, detail={"code": error.code, "message": error.message}) from error
 
@@ -440,10 +551,14 @@ def create_app(
 
         async def run():
             try:
-                result = await app.state.agent.chat(message, request.conversation_id, emit=emit)
+                result = await run_chat(request, message, emit=emit)
                 await emit("result", result)
             except ModelError as error:
                 await emit("error", {"code": error.code, "message": error.message})
+            except ConversationError as error:
+                await emit("error", {"code": error.code, "message": error.message})
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("Chat stream failed")
                 await emit("error", {"code": "INTERNAL_ERROR", "message": "请求暂时未完成，请重试。"})

@@ -14,21 +14,14 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from .errors import BankError
 from .models import Account, Base, LedgerTransaction, Recipient, TransferPlan, User
+from .reservations import available_balance, reserved_balance
 
 DEMO_USER_ID = "demo-user-001"
 DEMO_USER_NAME = "林小满"
 MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
 TRANSFER_PLAN_TTL = timedelta(minutes=10)
-
-
-class BankError(Exception):
-    """Expected business error with a stable API code and Chinese message."""
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
 
 
 class BankService:
@@ -216,6 +209,8 @@ class BankService:
                 "name": row.name,
                 "kind": row.kind,
                 "balance_minor": row.balance_minor,
+                "reserved_minor": reserved_balance(session, row.id),
+                "available_minor": available_balance(session, row),
                 "currency": row.currency,
             }
             for row in rows
@@ -322,7 +317,7 @@ class BankService:
             destination = session.get(Account, recipient.destination_account_id)
             if destination is None or destination.currency != source.currency:
                 raise BankError("RECIPIENT_ACCOUNT_UNAVAILABLE", "收款账户暂不可用。")
-            if source.balance_minor < amount_minor:
+            if available_balance(session, source) < amount_minor:
                 raise BankError("INSUFFICIENT_BALANCE", "账户余额不足，请调整金额或选择其他账户。")
 
             if conversation_id:
@@ -415,7 +410,7 @@ class BankService:
             if source.currency != plan.currency:
                 raise BankError("PLAN_STATE_INVALID", "转账计划中的币种与出账账户不一致。")
 
-            if source.balance_minor < plan.total_minor:
+            if available_balance(session, source) < plan.total_minor:
                 plan.status = "declined"
                 plan.decision = "approve"
                 plan.outcome_status = "declined"

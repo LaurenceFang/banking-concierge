@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, ChevronDown, LoaderCircle, UserRound } from "lucide-react";
+import { ArrowUp, ChevronDown, LoaderCircle } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { streamChat, timestamp } from "../api";
@@ -13,6 +13,8 @@ interface Props {
   onOpen: () => void;
   onBusy: (busy: boolean) => void;
   decisionBusy: boolean;
+  scope?: string;
+  onCreated?: (id: string) => void;
 }
 export function ChatWorkspace({
   detail,
@@ -21,10 +23,16 @@ export function ChatWorkspace({
   onRefresh,
   onOpen,
   onBusy,
-  decisionBusy,
+  decisionBusy, scope, onCreated,
 }: Props) {
   const [messages, setMessages] = useState(detail.messages);
-  const [draft, setDraft] = useState("");
+  const draftKey = `yx2.draft.${detail.conversation.id}`;
+  const [draft, setDraft] = useState(() => { try { return localStorage.getItem(draftKey) ?? ""; } catch { return ""; } });
+  const retryKey = `yx2.retry.${detail.conversation.id}`;
+  const retry = useRef<{message:string; id:string; serverId?:string} | null>((() => {try { return JSON.parse(localStorage.getItem(retryKey) ?? "null"); } catch { return null; }})());
+  const serverId = useRef(retry.current?.serverId ?? (detail.conversation.id.startsWith("compose:") ? undefined : detail.conversation.id));
+  const persistRetry = () => {try { if (retry.current) localStorage.setItem(retryKey, JSON.stringify(retry.current)); else localStorage.removeItem(retryKey); } catch {}};
+  useEffect(() => { try { localStorage.setItem(draftKey, draft); } catch {} }, [draft, draftKey]);
   const [busy, setBusy] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [status, setStatus] = useState("");
@@ -51,31 +59,41 @@ export function ChatWorkspace({
     lock.current = true;
     setBusy(true);
     onBusy(true);
-    setDraft("");
     setError("");
     setStreamText("");
     setStatus("正在查询并整理答复…");
-    onAction(null);
+
     nearBottom.current = true;
-    setMessages((previous) => [
+    const isRetry = retry.current?.message === message;
+    const requestId = isRetry ? retry.current!.id : crypto.randomUUID();
+    retry.current = {message, id: requestId, serverId: serverId.current};
+    persistRetry();
+    setMessages((previous) => previous.some(item => item.id === requestId) || (isRetry && previous.filter(item=>item.role === "user").at(-1)?.text === message) ? previous : [
       ...previous,
       {
-        id: crypto.randomUUID(),
+        id: requestId,
         role: "user",
         text: message,
         created_at: new Date().toISOString(),
       },
     ]);
     try {
-      const result = await streamChat(message, detail.conversation.id, {
+      const result = await streamChat(message, serverId.current, {
+        onConversation: (id) => { serverId.current = id; if(retry.current)retry.current.serverId=id; persistRetry(); },
         onStatus: (value) => {
           if (alive.current) setStatus(value);
         },
         onToken: (value) => {
           if (alive.current) setStreamText((previous) => previous + value);
         },
-      });
+      }, {scope, client_request_id: requestId, ...(isRetry ? {retry_failed: true} : {})});
+      retry.current = null;
+      persistRetry();
+      try { localStorage.removeItem(draftKey); } catch {}
       if (!alive.current) return;
+      setDraft("");
+      serverId.current = result.conversation_id;
+      if (detail.conversation.id.startsWith("compose:")) { onCreated?.(result.conversation_id); return; }
       const action =
         result.action ??
         (result.plan
@@ -92,7 +110,7 @@ export function ChatWorkspace({
           created_at: new Date().toISOString(),
         },
       ]);
-      onAction(action);
+      if (action) onAction(action);
       onRefresh();
     } catch (failure) {
       if (alive.current) {
@@ -111,16 +129,10 @@ export function ChatWorkspace({
   function renderMessage(message: ChatMessage) {
     const actionId = message.action?.id ?? message.plan?.id;
     return (
-      <article className={`message ${message.role}`} key={message.id}>
-        <span className="avatar" aria-hidden="true">
-          {message.role === "user" ? (
-            <UserRound size={19} />
-          ) : (
-            <span className="assistant-dot" />
-          )}
-        </span>
+      <article className={`message ${message.role}`} key={message.id} tabIndex={0}
+        aria-label={message.role === "user" ? "你的消息" : message.role === "notification" ? "业务通知" : "银小二的回复"}>
         <div className="message-content">
-          <time dateTime={message.created_at}>
+          <time className="message-time" dateTime={message.created_at}>
             {timestamp(message.created_at)}
           </time>
           <div
@@ -152,11 +164,15 @@ export function ChatWorkspace({
               查看确认单 <span aria-hidden="true">›</span>
             </button>
           )}
+          {(message.action?.kind === "transfer" || message.plan) && <a className="text-button action-link" href="#/bills/payments">查看收付款 ›</a>}
           {message.receipt && (
             <div className="receipt">
-              <p>{message.receipt.message}</p>
+              {message.role !== "notification" && <p>{message.receipt.message}</p>}
               {message.receipt.operation_id && (
-                <small>回执编号：{message.receipt.operation_id}</small>
+                <details className="receipt-details">
+                  <summary>回执详情</summary>
+                  <small>回执编号：{message.receipt.operation_id}</small>
+                </details>
               )}
             </div>
           )}
@@ -181,10 +197,10 @@ export function ChatWorkspace({
             </span>
             <div>
               <p>
-                你好，我是银小二。
+                今天想聊点什么？
                 <br />
                 {detail.conversation.kind === "main"
-                  ? "日常咨询、账户回执和续费提醒，都可以在这里查看。"
+                  ? "Anything you can ask."
                   : "这件事，我们从这里开始聊。"}
               </p>
               <div className="quick-actions">
@@ -208,9 +224,6 @@ export function ChatWorkspace({
           {messages.map(renderMessage)}
           {busy && (
             <article className="message assistant">
-              <span className="avatar">
-                <span className="assistant-dot" />
-              </span>
               <div className="message-content">
                 <div className="markdown">
                   <Markdown remarkPlugins={[remarkGfm]}>{streamText}</Markdown>
@@ -229,6 +242,7 @@ export function ChatWorkspace({
         {error && (
           <p className="inline-error" role="alert">
             {error} 内容已保留，未自动重发。
+            <button className="text-button" disabled={busy || decisionBusy} onClick={() => retry.current && void submit(retry.current.message)}>重试回复</button>
           </p>
         )}
         {pending && (
@@ -262,7 +276,7 @@ export function ChatWorkspace({
             }}
             placeholder={
               detail.conversation.kind === "main"
-                ? "和日常助手聊聊…"
+                ? "有什么想问，或想让我帮你办的事？"
                 : "继续聊，或补充这件事…"
             }
             rows={1}

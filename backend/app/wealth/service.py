@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.bank.models import Account, LedgerTransaction, User
+from app.bank.reservations import available_balance
 from app.bank.service import MAX_SAFE_JSON_INTEGER, BankError
 
 from .models import (
@@ -346,7 +347,7 @@ class WealthService:
                 total_minor = amount_minor + fee_minor
                 if total_minor > MAX_SAFE_JSON_INTEGER:
                     raise BankError("INVALID_AMOUNT", "申购金额与费用超过安全整数范围。")
-                if account.balance_minor < total_minor:
+                if available_balance(session, account) < total_minor:
                     raise BankError("INSUFFICIENT_BALANCE", "账户余额不足，未创建申购预览。")
                 payout_minor = 0
                 risk_level = product.risk_level
@@ -564,7 +565,7 @@ class WealthService:
                 raise BankError("CLEARING_ACCOUNT_UNAVAILABLE", "模拟理财清算账户不可用，操作已回滚。")
 
             if plan.action == "purchase":
-                if account.balance_minor < plan.total_minor:
+                if available_balance(session, account) < plan.total_minor:
                     self._decline_plan(
                         plan, now, "INSUFFICIENT_BALANCE", "账户余额已变化且不足，申购未执行。"
                     )

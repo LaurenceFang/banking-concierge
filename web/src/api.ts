@@ -52,10 +52,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const getOverview = () => request<Overview>("/overview");
-export const sendChat = (message: string, conversationId?: string) =>
+export interface ChatContext { scope?: string; client_request_id?: string; retry_failed?: boolean }
+export const sendChat = (message: string, conversationId?: string, context: ChatContext = {}) =>
   request<ChatResponse>("/chat", {
     method: "POST",
     body: JSON.stringify({
+      ...context,
       message,
       ...(conversationId ? { conversation_id: conversationId } : {}),
     }),
@@ -64,12 +66,14 @@ export const sendChat = (message: string, conversationId?: string) =>
 interface StreamHandlers {
   onStatus: (message: string) => void;
   onToken: (text: string) => void;
+  onConversation?: (id: string) => void;
 }
 
 export async function streamChat(
   message: string,
   conversationId: string | undefined,
   handlers: StreamHandlers,
+  context: ChatContext = {},
 ): Promise<ChatResponse> {
   let response: Response;
   try {
@@ -80,7 +84,8 @@ export async function streamChat(
         Accept: "text/event-stream",
       },
       body: JSON.stringify({
-        message,
+        ...context,
+      message,
         ...(conversationId ? { conversation_id: conversationId } : {}),
       }),
     });
@@ -93,7 +98,7 @@ export async function streamChat(
   // Only route-level rejection proves the stream request was not processed.
   // Once accepted, never replay a request that may have created a transfer plan.
   if (response.status === 404 || response.status === 405)
-    return sendChat(message, conversationId);
+    return sendChat(message, conversationId, context);
   if (!response.ok) {
     const data = await response.json().catch(() => null);
     throw new ApiError(
@@ -128,6 +133,7 @@ export async function streamChat(
       handlers.onStatus(data.message);
     else if (event === "token" && typeof data.text === "string")
       handlers.onToken(data.text);
+    else if (event === "conversation" && typeof data.conversation_id === "string") handlers.onConversation?.(data.conversation_id);
     else if (event === "result") result = data as ChatResponse;
     else if (event === "error")
       throw new ApiError(data.message ?? "答复中断，请稍后重试。", data.code);
@@ -181,10 +187,10 @@ export const decidePlan = (
     body: JSON.stringify({ decision, conversation_id: conversationId }),
   });
 
-export const getConversations = () =>
-  request<{ conversations: Conversation[] }>("/conversations");
-export const createConversation = () =>
-  request<Conversation>("/conversations", { method: "POST", body: "{}" });
+export const getConversations = (scope?: string) =>
+  request<{ conversations: Conversation[] }>(`/conversations${scope ? `?${new URLSearchParams({scope})}` : ""}`);
+export const createConversation = (scope?: string, client_request_id?: string) =>
+  request<Conversation>("/conversations", { method: "POST", body: JSON.stringify({scope, client_request_id}) });
 export const renameConversation = (id: string, title: string) =>
   request<Conversation>(`/conversations/${encodeURIComponent(id)}`, {
     method: "PATCH",

@@ -9,12 +9,12 @@ const cycles: Record<string, string> = {
   annual: "每年",
 };
 export function SubscriptionsPage({
-  conversationId,
+  conversationId, ensureConversation,
   onAction,
   revision,
   blocked,
 }: {
-  conversationId: string;
+  conversationId: string; ensureConversation:()=>Promise<string>;
   onAction: (action: Action) => void;
   revision: number;
   blocked: boolean;
@@ -47,12 +47,12 @@ export function SubscriptionsPage({
     };
   }, [revision]);
   async function preview(id: string, action: SubscriptionAction["action"]) {
-    if (previewLock.current || blocked || !conversationId) return;
+    if (previewLock.current || blocked) return;
     previewLock.current = true;
     setBusy(id);
     setError("");
     try {
-      const result = await previewSubscription(id, action, conversationId);
+      const result = await previewSubscription(id, action, await ensureConversation());
       if (alive.current) onAction(result);
     } catch (failure) {
       if (alive.current)
