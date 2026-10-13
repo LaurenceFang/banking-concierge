@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime
 from decimal import Decimal
 from typing import TypedDict
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from langgraph.graph import END, START, StateGraph
 
@@ -144,6 +146,36 @@ P3_TOOLS = [
     tool("cancel_action_preview", "撤销当前会话待确认的操作，不撤销已受理或已完成的订单。", {}, []),
 ]
 
+TASK_TOOLS = [
+    tool("get_task_clock", "查询AA与定时转账使用的当前模拟时间，按北京时间展示；不推进时间。", {}, []),
+    tool("list_tasks", "查询AA请求和定时转账的当前状态、到账与预留金额；不触发任务执行。", {}, []),
+    tool(
+        "create_task_preview",
+        "仅生成AA或定时转账的待确认预览。AA需要参与者ID；定时转账需要账户、已消歧收款人、金额和带时区时间。不会确认、付款或推进时钟。",
+        {
+            "action": {
+                "type": "string",
+                "enum": ["create_aa", "cancel_aa", "schedule_transfer", "cancel_schedule"],
+            },
+            "title": {"type": "string", "maxLength": 120},
+            "account_id": {"type": "string"},
+            "total_minor": {"type": "integer", "minimum": 1},
+            "participant_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 20,
+            },
+            "recipient_id": {"type": "string"},
+            "amount_minor": {"type": "integer", "minimum": 1},
+            "execute_at": {"type": "string", "description": "带时区的ISO-8601时间"},
+            "task_id": {"type": "string"},
+        },
+        ["action"],
+    ),
+    tool("cancel_task_preview", "撤销当前对话尚未确认的AA或定时转账预览；不取消已确认任务。", {}, []),
+]
+
 
 class State(TypedDict, total=False):
     conversation_id: str
@@ -167,13 +199,21 @@ class BankingAgent:
         subscriptions=None,
         cards=None,
         wealth=None,
+        tasks=None,
+        task_clock=None,
         *,
         enable_p3_actions: bool = False,
+        enable_tasks_actions: bool = False,
     ) -> None:
         self.bank, self.knowledge, self.store, self.model = bank, knowledge, store, model
         self.billing, self.subscriptions = billing, subscriptions
         self.cards, self.wealth = cards, wealth
-        self.tools = TOOLS + (P3_TOOLS if enable_p3_actions else [])
+        self.tasks, self.task_clock = tasks, task_clock
+        self.tools = (
+            TOOLS
+            + (P3_TOOLS if enable_p3_actions else [])
+            + (TASK_TOOLS if enable_tasks_actions else [])
+        )
         self.system_prompt = SYSTEM.replace(
             "卡片、理财、支付宝通知接入、鲜花下单目前未实现。",
             "当前界面尚未开放卡片与理财办理；支付宝通知接入、鲜花下单目前未实现。",
@@ -189,13 +229,24 @@ class BankingAgent:
                 "\n申购确认后先受理、扣款，T+1结算后才入持仓；赎回先预占份额，T+1到账前不能称现金已到。"
                 "\n所有产品规则与金额通过工具获取，不保证收益；你不能推进模拟时钟或批准任何卡片/理财操作。"
             )
+        if enable_tasks_actions:
+            self.system_prompt += (
+                "\nAA和定时转账可查询任务、收款人和模拟时钟，并生成或撤销待确认预览。你没有确认、模拟付款或推进时间的工具。"
+                "\nAA均分必须使用用户明确提供或收款人查询返回的ID；本人份额不计到账。重名时说明银行与尾号并等待用户选择，不猜联系人。"
+                "\n定时转账必须具备明确账户、联系人、金额和带时区时间；相对日期先查询当前模拟时钟并换算为北京时间，模糊时段先追问。"
+                "\n预览不代表已受理；只有用户明确确认后才创建AA请求或预留定时转账资金。到账只能引用任务查询或服务端回执。"
+                "\n普通聊天和只读查询保留确认单；新预览只替换尚未确认的旧预览。后续聊天不会取消已经确认的定时任务。"
+            )
         self._locks: dict[str, asyncio.Lock] = {}
 
     def conversation_lock(self, identity: str) -> asyncio.Lock:
         return self._locks.setdefault(identity, asyncio.Lock())
 
     def invalidate_plans(self, identity: str, keep=None):
-        for service in (self.bank, self.subscriptions, self.cards, self.wealth):
+        services = [self.bank, self.subscriptions, self.cards, self.wealth]
+        if self.tasks:
+            services.append(self.tasks)
+        for service in services:
             if service and service is not keep:
                 service.invalidate_pending_plans(identity)
 
@@ -239,6 +290,7 @@ class BankingAgent:
                     "subscription": self.subscriptions,
                     "card": self.cards,
                     "wealth": self.wealth,
+                    "task": self.tasks,
                 }.get(kind)
                 current = service.get_plan(action["id"]) if service else None
                 if not current or current.get("status") != "pending":
@@ -464,6 +516,59 @@ class BankingAgent:
                                 "action": action,
                                 "instruction": "只生成确认单，没有执行。申购/赎回仍需受理和结算。",
                             }
+                        elif name == "get_task_clock" and self.tasks and TASK_TOOLS[0] in self.tools:
+                            await progress("正在查询安排使用的模拟时间…")
+                            now = await asyncio.to_thread(self.task_clock.now)
+                            result = {
+                                "now_utc": now.isoformat(),
+                                "now_beijing": now.astimezone(ZoneInfo("Asia/Shanghai")).isoformat(),
+                                "timezone": "Asia/Shanghai",
+                            }
+                            facts["task_clock"] = result
+                        elif name == "list_tasks" and self.tasks and TASK_TOOLS[0] in self.tools:
+                            await progress("正在查询AA和定时转账…")
+                            aa = await asyncio.to_thread(self.tasks.list_aa)
+                            schedules = await asyncio.to_thread(self.tasks.list_schedules)
+                            now = await asyncio.to_thread(self.task_clock.now)
+                            result = {
+                                "aa": aa,
+                                "schedules": schedules,
+                                "now_utc": now.isoformat(),
+                                "now_beijing": now.astimezone(ZoneInfo("Asia/Shanghai")).isoformat(),
+                                "timezone": "Asia/Shanghai",
+                            }
+                            facts["tasks"] = result
+                        elif name == "create_task_preview" and self.tasks and TASK_TOOLS[0] in self.tools:
+                            await progress("正在准备AA或定时转账预览…")
+                            action = await asyncio.to_thread(
+                                self.tasks.create_action_plan,
+                                arguments["action"],
+                                conversation_id,
+                                title=arguments.get("title"),
+                                account_id=arguments.get("account_id"),
+                                total_minor=arguments.get("total_minor"),
+                                participant_ids=arguments.get("participant_ids"),
+                                recipient_id=arguments.get("recipient_id"),
+                                amount_minor=arguments.get("amount_minor"),
+                                execute_at=arguments.get("execute_at"),
+                                task_id=arguments.get("task_id"),
+                            )
+                            action = {**action, "kind": "task", "conversation_id": conversation_id}
+                            self.store.note_chat_action(client_request_id, action)
+                            self.invalidate_plans(conversation_id, keep=self.tasks)
+                            plan = None
+                            result = {
+                                "action": action,
+                                "instruction": "只生成待确认预览。尚未创建AA请求、预留资金或执行转账。",
+                            }
+                        elif name == "cancel_task_preview" and self.tasks and TASK_TOOLS[0] in self.tools:
+                            self.invalidate_plans(conversation_id)
+                            plan = action = None
+                            result = {
+                                "status": "cancelled",
+                                "message": "当前对话待确认的办理预览已撤销；已确认的AA和定时任务不受影响。",
+                            }
+                            facts["cancelled_preview"] = result["message"]
                         elif name == "cancel_action_preview" and P3_TOOLS[0] in self.tools:
                             self.invalidate_plans(conversation_id)
                             plan = action = None
@@ -519,6 +624,48 @@ class BankingAgent:
                     reply = facts["operation_error"]
                 elif facts.get("cancelled_preview"):
                     reply = facts["cancelled_preview"]
+                elif facts.get("task_clock"):
+                    reply = "当前安排使用的模拟时间是北京时间 " + facts["task_clock"]["now_beijing"] + "。"
+                elif facts.get("tasks"):
+                    snapshot = facts["tasks"]
+                    aa_rows = snapshot["aa"][:6]
+                    schedule_rows = snapshot["schedules"][:6]
+                    if not aa_rows and not schedule_rows:
+                        reply = f"截至北京时间 {snapshot['now_beijing']}，目前没有AA收款请求或定时转账。"
+                    else:
+                        lines = []
+                        aa_status = {
+                            "awaiting_payment": "等待付款",
+                            "partial": "部分到账",
+                            "completed": "已收齐",
+                            "cancelled": "已取消",
+                        }
+                        for item in aa_rows:
+                            members = "、".join(
+                                f"{person['name']}{'已付款' if person['status'] == 'paid' else '待付款' if person['status'] == 'pending' else ''}"
+                                for person in item["participants"]
+                                if person["id"] != "self"
+                            )
+                            lines.append(
+                                f"AA「{item['title']}」：总额 {_money(item['total_minor'])}，"
+                                f"已到账 {_money(item['collected_minor'])}，{aa_status.get(item['status'], item['status'])}。"
+                                + (f"成员：{members}。" if members else "")
+                            )
+                        schedule_status = {
+                            "scheduled": "已安排，等待执行",
+                            "completed": "已执行",
+                            "cancelled": "已撤销",
+                            "expired": "已过期",
+                            "failed": "执行失败",
+                        }
+                        for item in schedule_rows:
+                            lines.append(
+                                f"定时转账给{item['recipient_name']} {_money(item['amount_minor'])}："
+                                f"{_format_task_time(item['execute_at'])}，"
+                                f"{schedule_status.get(item['status'], item['status'])}；"
+                                f"当前预留 {_money(item['reserved_minor'])}。"
+                            )
+                        reply = "\n".join(lines)
                 elif facts.get("cards"):
                     labels = {"active": "正常", "frozen": "已冻结", "lost": "已挂失", "closed": "已关闭"}
                     rows = "\n".join(
@@ -642,6 +789,16 @@ class BankingAgent:
 
 def _money(minor: int) -> str:
     return f"¥{Decimal(minor) / Decimal(100):,.2f}"
+
+
+def _format_task_time(value: str) -> str:
+    try:
+        instant = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if instant.tzinfo is None:
+        return instant.isoformat()
+    return instant.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%m月%d日 %H:%M 北京时间")
 
 
 def _humanize(reply: str) -> str:

@@ -5,6 +5,7 @@ import {
   PiggyBank,
   RefreshCw,
 } from "lucide-react";
+import { availableMoney } from "../task-utils";
 import { money, timestamp } from "../api";
 import type { Overview } from "../types";
 
@@ -66,10 +67,10 @@ export function AccountOverview({
               </span>
               <div className="account-name">
                 <h3>{account.name}</h3>
-                <span>模拟账户{expanded ? ` · ${account.id}` : ""}</span>
+                <span>账面 {money(account.balance_minor, account.currency)} · 预留 {money(account.reserved_minor ?? 0, account.currency)}</span>
               </div>
               <strong className="account-balance">
-                {money(account.balance_minor, account.currency)}
+                <small>可用 </small>{money(availableMoney(account), account.currency)}
               </strong>
             </div>
           ))}

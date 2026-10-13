@@ -1,7 +1,7 @@
 """HTTP entry points for explicitly confirmed demo tasks."""
 from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -53,6 +53,14 @@ class AdvanceRequest(BaseModel):
 def task_router(app, preview_domain, decide_domain):
     router = APIRouter(prefix="/api")
 
+    @router.get("/tasks/recipients")
+    def recipients(query: str = Query(default="", max_length=120)):
+        fields = ("id", "name", "bank_name", "account_hint")
+        return {"recipients": [
+            {key: recipient[key] for key in fields}
+            for recipient in app.state.bank.list_recipients(query)
+        ]}
+
     @router.get("/tasks")
     def tasks():
         app.state.sync_events()
@@ -85,6 +93,12 @@ def task_router(app, preview_domain, decide_domain):
         for _ in range(8):
             app.state.task_tick()
         return {"now": app.state.task_clock.now().isoformat(), "timezone": "Asia/Shanghai"}
+
+    return router
+
+
+def workflow_router(app, preview_domain, decide_domain):
+    router = APIRouter(prefix="/api")
 
     @router.get("/workflows")
     def workflows():

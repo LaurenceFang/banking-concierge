@@ -254,6 +254,11 @@ class BankService:
         needle = query.strip().casefold()
         if not needle:
             return []
+        return self.list_recipients(query)
+
+    def list_recipients(self, query: str = "") -> list[dict[str, Any]]:
+        """List only this user's saved recipients for explicit form selection."""
+        needle = query.strip().casefold()
         with self._session_factory() as session:
             recipients = session.scalars(
                 select(Recipient)
@@ -263,7 +268,7 @@ class BankService:
             matches = [
                 row
                 for row in recipients
-                if needle in row.name.casefold()
+                if not needle or needle in row.name.casefold()
                 or needle in row.bank_name.casefold()
                 or needle in row.account_last4.casefold()
                 or needle in row.id.casefold()

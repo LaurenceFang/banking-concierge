@@ -14,7 +14,7 @@ export function SubscriptionsPage({
   revision,
   blocked,
 }: {
-  conversationId: string; ensureConversation:()=>Promise<string>;
+  conversationId: string; ensureConversation:(existingId?:string)=>Promise<string>;
   onAction: (action: Action) => void;
   revision: number;
   blocked: boolean;

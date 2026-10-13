@@ -84,6 +84,12 @@ class ConversationScope(Base):
     user_override = Column(Boolean, nullable=False, default=False)
 
 
+class ConversationPin(Base):
+    __tablename__ = "chat_conversation_pins"
+    conversation_id = Column(String(80), primary_key=True)
+    pinned_at = Column(String(40), nullable=False)
+
+
 class ClientRequestReceipt(Base):
     __tablename__ = "chat_client_request_receipts"
     id = Column(String(160), primary_key=True)
@@ -182,6 +188,8 @@ class ConversationStore:
             return "accounts/cards"
         if kind == "subscription":
             return "life/subscriptions"
+        if kind == "task":
+            return "bills/payments"
         if kind == "wealth":
             return "wealth/orders"
         return None
@@ -528,6 +536,7 @@ class ConversationStore:
             .where(ConversationScope.conversation_id == row.id)
             .order_by(ConversationScope.is_primary.desc(), ConversationScope.scope)
         ).all()
+        pin = session.get(ConversationPin, row.id)
         return {
             "id": row.id,
             "title": meta.title,
@@ -535,6 +544,8 @@ class ConversationStore:
             "updated_at": row.updated_at,
             "unread_count": meta.unread_count,
             "scopes": scopes,
+            "pinned": pin is not None,
+            "pinned_at": pin.pinned_at if pin else None,
         }
 
     @staticmethod
@@ -579,6 +590,25 @@ class ConversationStore:
         with self._lock, Session(self.engine) as session, session.begin():
             row, meta = self._require(session, identity)
             meta.title, row.updated_at = title.strip()[:80], _now()
+            return self._summary(session, row, meta)
+
+    def set_pinned(self, identity: str, pinned: bool) -> dict:
+        if type(pinned) is not bool:
+            raise ConversationError("INVALID_PIN", "请选择置顶或取消置顶。")
+        with self._lock, Session(self.engine) as session, session.begin():
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            # Serialize simultaneous pin toggles without changing activity time.
+            session.scalar(select(Conversation).where(Conversation.id == identity).with_for_update())
+            row, meta = self._require(session, identity)
+            if meta.kind == "main":
+                raise ConversationError("CANNOT_PIN_MAIN", "主对话已有固定入口，无需置顶。")
+            pin = session.get(ConversationPin, identity)
+            if pinned and pin is None:
+                session.add(ConversationPin(conversation_id=identity, pinned_at=_now()))
+            elif not pinned and pin is not None:
+                session.delete(pin)
+            session.flush()
             return self._summary(session, row, meta)
 
     def mark_read(self, identity: str):
@@ -665,14 +695,25 @@ class ConversationStore:
                 ):
                     # A late acceptance snapshot must not undo a newer settlement.
                     continue
+                effective_receipt = receipt
+                if receipt and receipt.get("task_id"):
+                    # Durable task events report task_status, not confirmation status.
+                    # Receiving such an event implies the creation/cancellation was
+                    # already confirmed; it does not mean the task itself is complete.
+                    effective_receipt = {
+                        **old_receipt,
+                        **receipt,
+                        "status": receipt.get("status", old_receipt.get("status", "completed")),
+                        "message": receipt.get("message", message),
+                    }
                 targets.add(view.conversation_id)
-                if receipt and old_receipt != receipt:
+                if effective_receipt and old_receipt != effective_receipt:
                     changed.add(view.conversation_id)
-                    payload["receipt"] = receipt
-                    if payload.get("action"):
-                        payload["action"]["status"] = receipt["status"]
-                    if payload.get("plan"):
-                        payload["plan"]["status"] = receipt["status"]
+                    payload["receipt"] = effective_receipt
+                    if payload.get("action") and effective_receipt.get("status"):
+                        payload["action"]["status"] = effective_receipt["status"]
+                    if payload.get("plan") and effective_receipt.get("status"):
+                        payload["plan"]["status"] = effective_receipt["status"]
                     view.payload = json.dumps(payload, ensure_ascii=False)
             for identity in targets:
                 row, _ = self._require(session, identity)

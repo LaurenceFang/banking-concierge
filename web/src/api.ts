@@ -1,4 +1,5 @@
 import type {
+  TaskList, TaskRecipient, TaskAction, TaskPreviewInput,
   ChatResponse,
   DecisionResponse,
   Overview,
@@ -191,6 +192,11 @@ export const getConversations = (scope?: string) =>
   request<{ conversations: Conversation[] }>(`/conversations${scope ? `?${new URLSearchParams({scope})}` : ""}`);
 export const createConversation = (scope?: string, client_request_id?: string) =>
   request<Conversation>("/conversations", { method: "POST", body: JSON.stringify({scope, client_request_id}) });
+export const pinConversation = (id: string, pinned: boolean) =>
+  request<Conversation>(`/conversations/${encodeURIComponent(id)}/pin`, {
+    method: "PATCH",
+    body: JSON.stringify({ pinned }),
+  });
 export const renameConversation = (id: string, title: string) =>
   request<Conversation>(`/conversations/${encodeURIComponent(id)}`, {
     method: "PATCH",
@@ -231,7 +237,7 @@ export const decideAction = (
   action.kind === "transfer"
     ? decidePlan(action.id, decision, conversationId)
     : request<DecisionResponse>(
-        `/${action.kind === "card" ? "card" : action.kind === "wealth" ? "wealth" : "subscription"}-plans/${encodeURIComponent(action.id)}/decision`,
+        `/${action.kind === "task" ? "task" : action.kind === "card" ? "card" : action.kind === "wealth" ? "wealth" : "subscription"}-plans/${encodeURIComponent(action.id)}/decision`,
         {
           method: "POST",
           body: JSON.stringify({ decision, conversation_id: conversationId }),
@@ -269,3 +275,10 @@ export const timestamp = (value: string) => {
         minute: "2-digit",
       }).format(date);
 };
+
+export const getTasks = () => request<TaskList>("/tasks");
+export const getTaskRecipients = (query = "") => request<{recipients: TaskRecipient[]}>(`/tasks/recipients?${new URLSearchParams({query})}`);
+export const previewTask = (input: TaskPreviewInput) => request<TaskAction>("/tasks/preview", {method:"POST",body:JSON.stringify(input)});
+export const simulateTaskPayment = (id: string, participantId: string) => request<DecisionResponse>(`/tasks/${encodeURIComponent(id)}/demo-payment`, {method:"POST",body:JSON.stringify({participant_id:participantId})});
+export const getTaskClock = () => request<{now:string;timezone:string}>("/tasks/clock");
+export const advanceTaskClock = (minutes: number) => request<{now:string;timezone:string}>("/tasks/demo/advance", {method:"POST",body:JSON.stringify({minutes})});

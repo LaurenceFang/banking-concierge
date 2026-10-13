@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { decideAction, money, timestamp } from "../api";
 import type { Account, Action, DecisionResponse } from "../types";
+import { availableMoney } from "../task-utils";
+import { TaskConfirmation } from "./TaskConfirmation";
 import { cardStatus } from "./CardsPage";
 interface Props {
   action: Action;
@@ -97,7 +99,7 @@ export function ActionDrawer({
             {source && (
               <div>
                 <dt>可用余额</dt>
-                <dd>{money(source.balance_minor, source.currency)}</dd>
+                <dd>{money(availableMoney(source), source.currency)}</dd>
               </div>
             )}
             <div>
@@ -116,7 +118,7 @@ export function ActionDrawer({
             <p>有效期至：{timestamp(action.expires_at)}</p>
           </details>
         </>
-      ) : action.kind === "card" ? (
+      ) : action.kind === "task" ? <TaskConfirmation action={action} accounts={accounts}/> : action.kind === "card" ? (
         <>
           <div className="subscription-effect"><h3>{action.card_name ?? (action.card_kind==="credit"?"信用卡申请":"借记卡申请")}</h3><p>{action.description}</p></div>
           <dl className="transfer-fields">
@@ -171,6 +173,8 @@ export function ActionDrawer({
           >
             {busy
               ? "正在办理…"
+              : action.kind === "task"
+                ? ({create_aa:"确认创建AA",cancel_aa:"确认取消未付",schedule_transfer:"确认安排",cancel_schedule:"确认撤销"}[action.action])
               : action.kind === "transfer"
                 ? "确认转账"
                 : action.kind === "card"

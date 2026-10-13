@@ -908,7 +908,14 @@ class TasksService:
                 .where(TaskEvent.owner_id == DEMO_USER_ID)
                 .order_by(TaskEvent.created_at, TaskEvent.id)
             ).all()
-            return [_event_dict(row) for row in rows]
+            result = []
+            for row in rows:
+                event = _event_dict(row)
+                origin = _origin_plan_for_task(session, row.task_id)
+                if origin and origin != row.plan_id:
+                    event["related_plan_ids"] = [origin]
+                result.append(event)
+            return result
 
 
 def _validate_title(title: str | None) -> str | None:

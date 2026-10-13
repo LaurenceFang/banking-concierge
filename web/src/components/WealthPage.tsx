@@ -1,3 +1,4 @@
+import { availableMoney } from "../task-utils";
 import { useState } from "react";
 import { advanceWealthDay, getWealth, money, parseMinor, previewWealth, saveRiskProfile } from "../api";
 import type { Account, Action, RiskAnswers, WealthPosition, WealthProduct } from "../types";
@@ -12,7 +13,7 @@ const questions: {key:keyof RiskAnswers; label:string; options:[string,string][]
 ];
 const fee = (bps:number) => bps===0?"0":`${(bps/100).toFixed(2)}%`;
 export function WealthPage({conversationId, ensureConversation,revision,blocked,onAction,onBusy,accounts,onRefresh,section="positions"}: {
-  section?:string; conversationId:string; ensureConversation:()=>Promise<string>;revision:number;blocked:boolean;onAction:(action:Action)=>void;onBusy:(busy:boolean)=>void;accounts:Account[];onRefresh:()=>void;
+  section?:string; conversationId:string; ensureConversation:(existingId?:string)=>Promise<string>;revision:number;blocked:boolean;onAction:(action:Action)=>void;onBusy:(busy:boolean)=>void;accounts:Account[];onRefresh:()=>void;
 }) {
   const {data,error,busy,run,alive} = useDomainPage(getWealth,revision,onBusy);
   const [showRisk,setShowRisk] = useState<boolean | null>(null);
@@ -56,7 +57,7 @@ export function WealthPage({conversationId, ensureConversation,revision,blocked,
       {section === "products" && <div className="table-scroll"><table className="wealth-table"><thead><tr><th>模拟产品</th><th>风险</th><th>起购金额</th><th>申购费 · 赎回费</th><th>锁定期</th><th>结算</th><th>操作</th></tr></thead><tbody>{data.products.slice().sort((a,b)=>a.risk_level-b.risk_level).map(product=><tr key={product.id}><td>{product.name}</td><td>R{product.risk_level}</td><td>{money(product.min_purchase_minor)}</td><td>{fee(product.purchase_fee_bps)} · {fee(product.redemption_fee_bps)}</td><td>{product.lock_days}天</td><td>T+{product.settlement_business_days}</td><td>{product.eligible?<button className="button secondary" disabled={disabled} onClick={()=>select(product)}>预览申购</button>:<span className="muted small">{data.risk_profile?"风险等级不匹配":"请先完成风险测评"}</span>}</td></tr>)}</tbody></table></div>}
       {selection && <form className="p3-inline-form wealth-amount-form" onSubmit={e=>{e.preventDefault();preview();}}><h3>{selection.position?"赎回":"申购"}{selection.product.name}</h3>
         <label>{selection.position?"赎回份额本金（元）":"申购金额（元）"}<input autoFocus required inputMode="decimal" value={amount} onChange={e=>setAmount(e.target.value)}/></label>
-        <label>{selection.position?"到账账户":"付款账户"}<select required value={accountId} onChange={e=>setAccountId(e.target.value)}><option value="" disabled>请选择账户</option>{accounts.map(account=><option key={account.id} value={account.id}>{account.name} · 余额 {money(account.balance_minor)}</option>)}</select></label>
+        <label>{selection.position?"到账账户":"付款账户"}<select required value={accountId} onChange={e=>setAccountId(e.target.value)}><option value="" disabled>请选择账户</option>{accounts.map(account=><option key={account.id} value={account.id}>{account.name} · 可用 {money(availableMoney(account))}</option>)}</select></label>
         <p className="muted small">{selection.position?`可用份额本金 ${money(selection.position.available_minor)}。`:`起购 ${money(selection.product.min_purchase_minor)}，申购费率 ${fee(selection.product.purchase_fee_bps)}。`}准确费用及结算日将在确认单中展示。</p>
         <button className="button secondary" disabled={disabled || !accountId || !amount}>准备确认单</button><button className="text-button" type="button" disabled={busy} onClick={()=>setSelection(null)}>收起</button>
       </form>}

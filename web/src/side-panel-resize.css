@@ -1,0 +1,27 @@
+.workspace-layout { position: relative; }
+.workspace-layout > .chat-panel:not(.full-chat),
+.workspace-layout > .confirmation-slot {
+  position: relative; inset: auto; width: var(--side-panel-width, 360px);
+  min-width: 0; max-width: 100%; flex-shrink: 0; box-shadow: none;
+}
+.workspace-layout.side-overlay > .chat-panel:not(.full-chat),
+.workspace-layout.side-overlay > .confirmation-slot {
+  position: absolute; inset: 0 0 0 auto; z-index: 21;
+  box-shadow: -8px 0 20px #3c493b08;
+}
+.side-panel-resizer {
+  position: absolute; left: -4px; top: 0; bottom: 0; width: 8px;
+  z-index: 25; cursor: col-resize; touch-action: none; outline: none;
+}
+.side-panel-resizer::after {
+  content: ""; position: absolute; left: 3px; top: 0; bottom: 0; width: 1px;
+  background: transparent; transition: background 120ms ease;
+}
+.side-panel-resizer:hover::after, .side-panel-resizer:focus-visible::after,
+.side-resizing .side-panel-resizer::after { background: #b8c0b4; }
+.side-resizing, .side-resizing * { cursor: col-resize !important; user-select: none; }
+@media (max-width: 760px) {
+  .workspace-layout > .chat-panel:not(.full-chat),
+  .workspace-layout > .confirmation-slot { width: 100%; }
+  .side-panel-resizer { display: none; }
+}

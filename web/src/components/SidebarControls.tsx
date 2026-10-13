@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Pencil } from "lucide-react";
+import { Pencil, Pin, PinOff, ChevronDown, ChevronRight } from "lucide-react";
+
+import type { Conversation } from "../types";
 
 const WIDTH_KEY = "yx2.rail.width.v1";
 const minimum = 200;
@@ -91,26 +93,36 @@ export function ConversationTitle({ title }: { title: string }) {
 export interface ConversationMenuTarget {
   id: string;
   title: string;
+  pinned: boolean;
   x: number;
   y: number;
   trigger: HTMLElement;
 }
 
-export function ConversationMenu({ target, onClose, onRename }: {
+export function ConversationMenu({ target, onClose, onRename, onPin, busy }: {
   target: ConversationMenuTarget;
   onClose: () => void;
   onRename: () => void;
+  onPin: () => void;
+  busy: boolean;
 }) {
   const menu = useRef<HTMLDivElement>(null);
-  const rename = useRef<HTMLButtonElement>(null);
+  const firstItem = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    rename.current?.focus();
+    firstItem.current?.focus();
     const outside = (event: globalThis.PointerEvent) => {
       if (!menu.current?.contains(event.target as Node)) onClose();
     };
     const escape = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); onClose(); }
       if (event.key === "Tab") onClose();
+      if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        event.preventDefault();
+        const items = Array.from(menu.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? []);
+        const current = items.indexOf(document.activeElement as HTMLButtonElement);
+        const index = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (current + (event.key === "ArrowUp" ? -1 : 1) + items.length) % items.length;
+        items[index]?.focus();
+      }
     };
     window.addEventListener("pointerdown", outside);
     window.addEventListener("keydown", escape, true);
@@ -121,16 +133,60 @@ export function ConversationMenu({ target, onClose, onRename }: {
       window.removeEventListener("keydown", escape, true);
       window.removeEventListener("resize", onClose);
       window.removeEventListener("scroll", onClose, true);
-      if (document.activeElement === rename.current || document.activeElement === document.body) {
+      if (menu.current?.contains(document.activeElement) || document.activeElement === document.body) {
         if (target.trigger.isConnected) target.trigger.focus();
       }
     };
   }, [target, onClose]);
   return createPortal(<div
     ref={menu} className="conversation-context-menu" role="menu" aria-label="对话操作"
-    style={{ left: Math.max(8, Math.min(target.x, window.innerWidth - 184)), top: Math.max(8, Math.min(target.y, window.innerHeight - 60)) }}
+    style={{ left: Math.max(8, Math.min(target.x, window.innerWidth - 184)), top: Math.max(8, Math.min(target.y, window.innerHeight - 102)) }}
     onContextMenu={event => event.preventDefault()}
   >
-    <button ref={rename} role="menuitem" onClick={onRename}><Pencil size={15} />重命名</button>
+    <button ref={firstItem} role="menuitem" disabled={busy} onClick={onPin}>{target.pinned ? <PinOff size={15}/> : <Pin size={15}/>} {busy ? "正在更新…" : target.pinned ? "取消置顶" : "置顶"}</button>
+    <button role="menuitem" disabled={busy} onClick={onRename}><Pencil size={15} />重命名</button>
   </div>, document.body);
+}
+
+
+export function splitConversationGroups(conversations: Conversation[]) {
+  const ordinary = conversations.filter(item => item.kind !== "main");
+  return {
+    pinned: ordinary.filter(item => item.pinned).sort((a, b) => (b.pinned_at ?? "").localeCompare(a.pinned_at ?? "") || a.id.localeCompare(b.id)),
+    recent: ordinary.filter(item => !item.pinned),
+  };
+}
+
+type GroupName = "pinned" | "recent";
+type GroupPreferences = Record<string, Partial<Record<GroupName, boolean>>>;
+const GROUP_KEY = "yx2.sidebar.groups.v1";
+export function useConversationGroups(scope?: string) {
+  const [preferences, setPreferences] = useState<GroupPreferences>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(GROUP_KEY) ?? "{}");
+      return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+    } catch { return {}; }
+  });
+  const key = scope ?? "global";
+  const open = (group: GroupName) => preferences[key]?.[group] !== false;
+  const toggle = (group: GroupName) => setPreferences(previous => {
+    const next = {...previous, [key]: {...previous[key], [group]: previous[key]?.[group] === false}};
+    try { localStorage.setItem(GROUP_KEY, JSON.stringify(next)); } catch { /* Optional preference. */ }
+    return next;
+  });
+  return { open, toggle };
+}
+
+export function ConversationGroup({ name, label, open, loading, empty, children, onToggle }: {
+  name: GroupName; label: string; open: boolean; loading: boolean; empty: boolean;
+  children: ReactNode; onToggle: () => void;
+}) {
+  return <section className="conversation-group" aria-label={label}>
+    <button className="conversation-group-heading" aria-expanded={open} aria-controls={`conversation-group-${name}`} onClick={onToggle}>
+      <span>{label}</span>{open ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}
+    </button>
+    {open && <div id={`conversation-group-${name}`}>
+      {loading ? <p className="rail-empty" role="status">正在读取…</p> : empty ? <p className="rail-empty">{name === "pinned" ? "常用对话可右键置顶。" : "还没有最近对话。"}</p> : children}
+    </div>}
+  </section>;
 }

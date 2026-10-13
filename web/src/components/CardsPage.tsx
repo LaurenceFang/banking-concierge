@@ -6,7 +6,7 @@ import { useDomainPage } from "./useDomainPage";
 
 export const cardStatus: Record<string, string> = {active:"正常", frozen:"已冻结", lost:"已挂失", closed:"已关闭"};
 export function CardsPage({ conversationId, ensureConversation, revision, blocked, onAction, onBusy }: {
-  conversationId:string; ensureConversation:()=>Promise<string>; revision:number; blocked:boolean; onAction:(action:Action)=>void; onBusy:(busy:boolean)=>void;
+  conversationId:string; ensureConversation:(existingId?:string)=>Promise<string>; revision:number; blocked:boolean; onAction:(action:Action)=>void; onBusy:(busy:boolean)=>void;
 }) {
   const {data,error,busy,run,alive} = useDomainPage(getCards,revision,onBusy);
   const [edit,setEdit] = useState<{card:Card; action:"set_daily_limit"|"set_credit_limit"}|null>(null);

@@ -3,6 +3,8 @@ export interface Account {
   name: string;
   kind: string;
   balance_minor: number;
+  reserved_minor?: number;
+  available_minor?: number;
   currency: string;
 }
 export interface Transaction {
@@ -49,6 +51,10 @@ export interface DecisionResponse {
   status: "completed" | "declined";
   message: string;
   operation_id?: string;
+  task_id?: string;
+  task_status?: string;
+  state_version?: number;
+  conversation_id?: string;
   order_id?: string;
   order_status?: "pending_settlement" | "settled";
 }
@@ -63,6 +69,8 @@ export interface ChatMessage {
   receipt?: DecisionResponse | null;
 }
 export interface Conversation {
+  pinned: boolean;
+  pinned_at: string | null;
   scopes?: string[];
   id: string;
   title: string;
@@ -72,7 +80,7 @@ export interface Conversation {
 }
 export type Action =
   | (Plan & { kind: "transfer"; title: string; conversation_id?: string })
-  | SubscriptionAction | CardAction | WealthAction;
+  | SubscriptionAction | CardAction | WealthAction | TaskAction;
 export interface SubscriptionAction {
   id: string;
   kind: "subscription";
@@ -208,4 +216,31 @@ export interface WealthAction extends DomainAction {
   kind: "wealth"; action: "purchase" | "redeem"; product_id: string; product_name: string;
   account_id: string; position_id: string | null; amount_minor: number; fee_minor: number;
   total_minor: number; payout_minor: number; settles_on: string; risk_level: number;
+}
+
+export interface TaskRecipient { id: string; name: string; bank_name: string; account_hint: string }
+export interface TaskParticipant { id: string; name: string; share_minor: number; status: "self" | "pending" | "paid" | "cancelled"; operation_id?: string }
+export interface TaskAction extends DomainAction {
+  kind: "task";
+  action: "create_aa" | "cancel_aa" | "schedule_transfer" | "cancel_schedule";
+  task_id?: string; account_id?: string; total_minor?: number; collectable_minor?: number;
+  participants?: TaskParticipant[]; recipient_id?: string; recipient_name?: string;
+  amount_minor?: number; execute_at?: string; deadline_at?: string; reserved_minor?: number;
+}
+export interface AATask {
+  id: string; title: string; account_id: string; total_minor: number; collectable_minor: number;
+  collected_minor: number; status: "awaiting_payment" | "partial" | "completed" | "cancelled";
+  participants: TaskParticipant[]; created_at: string; conversation_id: string; state_version: number;
+}
+export interface ScheduledTask {
+  id: string; account_id: string; recipient_id: string; recipient_name: string; amount_minor: number;
+  execute_at: string; deadline_at: string; status: "scheduled" | "completed" | "cancelled" | "expired" | "failed";
+  hold_id: string; reserved_minor: number; operation_id?: string; message: string;
+  conversation_id: string; state_version: number;
+}
+export interface TaskList { aa: AATask[]; schedules: ScheduledTask[]; now: string }
+export interface TaskPreviewInput {
+  action: TaskAction["action"]; conversation_id: string; title?: string; account_id?: string;
+  total_minor?: number; participant_ids?: string[]; recipient_id?: string; amount_minor?: number;
+  execute_at?: string; task_id?: string;
 }

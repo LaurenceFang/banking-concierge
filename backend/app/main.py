@@ -25,9 +25,10 @@ from .config import MODEL, ROOT, database_url
 from .conversations import ConversationError, ConversationStore
 from .knowledge.service import KnowledgeService
 from .llm import DeepSeekClient, ModelError
+from .pin_routes import conversation_pin_router
 from .subscriptions import SubscriptionService
 from .task_clock import TaskClock
-from .task_routes import task_router
+from .task_routes import task_router, workflow_router
 from .tasks import TasksService
 from .wealth import WealthService
 from .workflows import WorkflowService
@@ -99,6 +100,7 @@ def create_app(
     *,
     enable_p3_actions: bool = False,
     enable_tasks_actions: bool = False,
+    enable_workflow_actions: bool = False,
     task_poll_seconds: float = 2.0,
     workflow_fault_mode: str | None = None,
 ) -> FastAPI:
@@ -117,14 +119,17 @@ def create_app(
         cards.seed_demo()
         wealth = WealthService(url)
         wealth.seed_demo()
+        task_clock = TaskClock(url) if (enable_tasks_actions or enable_workflow_actions) else None
         if enable_tasks_actions:
-            task_clock = TaskClock(url)
             tasks = TasksService(url)
             tasks.seed_demo()
+        else:
+            tasks = None
+        if enable_workflow_actions:
             workflows = WorkflowService(url, fault_mode=workflow_fault_mode)
             workflows.seed_demo()
         else:
-            task_clock = tasks = workflows = None
+            workflows = None
         client = model or DeepSeekClient()
         app.state.bank, app.state.knowledge, app.state.store, app.state.model = bank, knowledge, store, client
         app.state.billing, app.state.subscriptions = billing, subscriptions
@@ -132,10 +137,11 @@ def create_app(
         app.state.p3_actions_enabled = enable_p3_actions
         app.state.tasks, app.state.workflows, app.state.task_clock = tasks, workflows, task_clock
         app.state.tasks_actions_enabled = enable_tasks_actions
+        app.state.workflow_actions_enabled = enable_workflow_actions
         app.state.sync_events = sync_events
         app.state.task_tick = task_tick
         app.state.task_tick_lock = RLock()
-        if enable_tasks_actions:
+        if enable_tasks_actions or enable_workflow_actions:
             task_tick()
         sync_events()
         app.state.agent = BankingAgent(
@@ -147,7 +153,10 @@ def create_app(
             subscriptions,
             cards,
             wealth,
+            tasks=tasks,
+            task_clock=task_clock,
             enable_p3_actions=enable_p3_actions,
+            enable_tasks_actions=enable_tasks_actions,
         )
         stop = asyncio.Event()
         async def background():
@@ -160,7 +169,7 @@ def create_app(
                     await asyncio.wait_for(stop.wait(), timeout=max(0.02, task_poll_seconds))
                 except TimeoutError:
                     pass
-        worker = asyncio.create_task(background()) if enable_tasks_actions else None
+        worker = asyncio.create_task(background()) if enable_tasks_actions or enable_workflow_actions else None
         try:
             yield
         finally:
@@ -176,7 +185,9 @@ def create_app(
         wealth.close()
         if tasks:
             tasks.close()
+        if workflows:
             workflows.close()
+        if task_clock:
             task_clock.close()
 
     app = FastAPI(title="银小二 · Banking Concierge", version="0.3.0", lifespan=lifespan)
@@ -186,6 +197,7 @@ def create_app(
         allow_methods=["GET", "POST", "PATCH"],
         allow_headers=["Content-Type"],
     )
+    app.include_router(conversation_pin_router(app))
 
     @app.exception_handler(BankError)
     async def bank_error(_, error):
@@ -225,6 +237,7 @@ def create_app(
         events += app.state.wealth.completed_events()
         if app.state.tasks_actions_enabled:
             events += app.state.tasks.completed_events()
+        if app.state.workflow_actions_enabled:
             events += app.state.workflows.completed_events()
         for event in events:
             store.publish(event)
@@ -235,11 +248,13 @@ def create_app(
                         store.note_decision(related, event["text"], event["receipt"])
 
     def task_tick():
-        if not app.state.tasks_actions_enabled:
+        if not (app.state.tasks_actions_enabled or app.state.workflow_actions_enabled):
             return
         with app.state.task_tick_lock:
-            app.state.tasks.process_due()
-            app.state.workflows.process_due()
+            if app.state.tasks_actions_enabled:
+                app.state.tasks.process_due()
+            if app.state.workflow_actions_enabled:
+                app.state.workflows.process_due()
             sync_events()
 
     def check_scope(plan, identity):
@@ -254,7 +269,9 @@ def create_app(
             "wealth": app.state.wealth,
         }
         if app.state.tasks_actions_enabled:
-            result.update({"task": app.state.tasks, "workflow": app.state.workflows})
+            result["task"] = app.state.tasks
+        if app.state.workflow_actions_enabled:
+            result["workflow"] = app.state.workflows
         return result
 
     def invalidate_other_plans(identity, keep):
@@ -267,7 +284,9 @@ def create_app(
             return None
         if action.get("kind") in {"card", "wealth"} and not app.state.p3_actions_enabled:
             return None
-        if action.get("kind") in {"task", "workflow"} and not app.state.tasks_actions_enabled:
+        if action.get("kind") == "task" and not app.state.tasks_actions_enabled:
+            return None
+        if action.get("kind") == "workflow" and not app.state.workflow_actions_enabled:
             return None
         return action
 
@@ -410,6 +429,8 @@ def create_app(
 
     if enable_tasks_actions:
         app.include_router(task_router(app, preview_domain, decide_domain))
+    if enable_workflow_actions:
+        app.include_router(workflow_router(app, preview_domain, decide_domain))
 
     @app.get("/api/cards")
     def cards_list():
@@ -486,6 +507,7 @@ def create_app(
             "knowledge_documents": app.state.knowledge.document_count,
             "p3_actions_enabled": app.state.p3_actions_enabled,
             "tasks_actions_enabled": app.state.tasks_actions_enabled,
+            "workflow_actions_enabled": app.state.workflow_actions_enabled,
         }
 
     @app.get("/api/overview")
@@ -614,4 +636,4 @@ def create_app(
     return app
 
 
-app = create_app(enable_p3_actions=True)
+app = create_app(enable_p3_actions=True, enable_tasks_actions=True)

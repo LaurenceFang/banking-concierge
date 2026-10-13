@@ -164,7 +164,7 @@ export function ChatWorkspace({
               查看确认单 <span aria-hidden="true">›</span>
             </button>
           )}
-          {(message.action?.kind === "transfer" || message.plan) && <a className="text-button action-link" href="#/bills/payments">查看收付款 ›</a>}
+          {(message.action?.kind === "transfer" || message.action?.kind === "task" || message.receipt?.task_id || message.plan) && <a className="text-button action-link" href="#/bills/payments">查看收付款 ›</a>}
           {message.receipt && (
             <div className="receipt">
               {message.role !== "notification" && <p>{message.receipt.message}</p>}
