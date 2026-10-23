@@ -354,6 +354,31 @@ class WorkflowService:
         merchant_name = merchant_name.strip()
         merchant = session.scalar(select(WorkflowMerchant).where(WorkflowMerchant.name == merchant_name))
         if merchant is not None:
+            # Older PG test fixture cleanup could leave the merchant row while
+            # removing its synthetic settlement account. Keep seeding idempotent
+            # and repair that dangling demo identity without resetting balances.
+            owner = session.get(User, merchant.owner_id)
+            expected_owner_name = f"{merchant_name}（模拟）"
+            if owner is None:
+                session.add(User(id=merchant.owner_id, name=expected_owner_name))
+                session.flush()
+            elif owner.name != expected_owner_name:
+                raise BankError("MERCHANT_IDENTITY_MISMATCH", "模拟商户身份记录不匹配。")
+            account = session.get(Account, merchant.account_id)
+            if account is None:
+                session.add(
+                    Account(
+                        id=merchant.account_id,
+                        owner_id=merchant.owner_id,
+                        name=f"{merchant_name}模拟结算账户",
+                        kind="workflow_merchant",
+                        balance_minor=0,
+                        currency="CNY",
+                    )
+                )
+                session.flush()
+            elif account.owner_id != merchant.owner_id or account.currency != "CNY":
+                raise BankError("MERCHANT_ACCOUNT_MISMATCH", "模拟商户结算账户身份不匹配。")
             return merchant
         identity = fixed or {}
         suffix = uuid4().hex if fixed is None else ""

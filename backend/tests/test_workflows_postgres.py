@@ -72,6 +72,10 @@ def postgres_workflows() -> Iterator[tuple[WorkflowService, list[str]]]:
 
     service = WorkflowService(raw_url)
     task_ids: list[str] = []
+    # Establish the demo baseline before recording rows owned by this fixture.
+    # Cleanup can then restore accounts/owners rather than leaving catalog-linked
+    # merchants without their settlement accounts for the next test run.
+    service.seed_demo()
     with service._session_factory() as session:
         original_users = {
             row.id: row.name for row in session.scalars(select(User).where(User.id.in_(USER_IDS))).all()
@@ -114,7 +118,6 @@ def postgres_workflows() -> Iterator[tuple[WorkflowService, list[str]]]:
             elif source.owner_id != DEMO_USER_ID or source.currency != "CNY":
                 pytest.fail("demo-checking-001 is not a CNY account owned by demo-user-001")
 
-        service.seed_demo()
         with service._transaction() as session:
             source = lock_accounts(session, SOURCE_ACCOUNT_ID)[SOURCE_ACCOUNT_ID]
             held = reserved_balance(session, SOURCE_ACCOUNT_ID)

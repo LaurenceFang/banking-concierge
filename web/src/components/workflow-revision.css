@@ -12,3 +12,6 @@
 .workflow-drawer>.inline-error{flex-shrink:0;margin:8px 0;font-size:13px}
 .workflow-drawer .workflow-revision h3{margin:12px 0 8px}
 .workflow-drawer .workflow-revision .amount-block{padding:12px 0;margin:12px 0}
+.workflow-discard-prompt{margin:0 20px 12px;padding:12px;border:1px solid #d7b98a;border-radius:8px;background:#fffaf0}
+.workflow-discard-prompt p{margin:0 0 6px;font-size:14px}
+.workflow-discard-prompt .button{width:100%;margin-top:8px}

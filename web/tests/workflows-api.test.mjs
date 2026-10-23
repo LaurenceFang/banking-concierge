@@ -4,7 +4,13 @@ import {readFile} from 'node:fs/promises';
 import ts from 'typescript';
 async function load(file){const source=await readFile(new URL(file,import.meta.url),'utf8');const compiled=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;return import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);}
 const api=await load('../src/api.ts');
-const {mergeWorkflowVersions,workflowOutcome,canRecoverWorkflow}=await load('../src/workflow-utils.ts');
+const {mergeWorkflowVersions,workflowOutcome,canRecoverWorkflow,workflowLeaveDecision}=await load('../src/workflow-utils.ts');
+test('workflow leave guard blocks in-flight saves and asks before discarding dirty edits',()=>{
+ assert.equal(workflowLeaveDecision(true,true),'block');
+ assert.equal(workflowLeaveDecision(true,false),'block');
+ assert.equal(workflowLeaveDecision(false,true),'confirm');
+ assert.equal(workflowLeaveDecision(false,false),'allow');
+});
 test('workflow APIs separate preview, explicit confirmation, cancellation and original-order recovery',async t=>{
  const prior=globalThis.fetch;t.after(()=>globalThis.fetch=prior);const calls=[];
  globalThis.fetch=async(url,init={})=>{calls.push({url,...init});return Response.json({id:'task1'});};

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 from datetime import datetime
 from decimal import Decimal
 from typing import TypedDict
@@ -713,6 +714,11 @@ class BankingAgent:
                             }
                             facts["workflow_clock"] = result
                         elif name == "create_workflow_preview" and self.workflows and WORKFLOW_TOOLS[0] in self.tools:
+                            if _workflow_time_is_unset(message):
+                                raise BankError(
+                                    "WORKFLOW_TIME_REQUIRED",
+                                    "你明确说了具体时间还没定，我不会默认成立即开始。请先告诉我希望安排在具体哪天几点。",
+                                )
                             await progress("正在按模拟目录准备服务安排预览…")
                             execute_at = arguments.get("execute_at")
                             if _workflow_requested_immediately(message):
@@ -823,11 +829,29 @@ class BankingAgent:
                     reply = facts["cancelled_preview"]
                 elif facts.get("preference_message"):
                     reply = facts["preference_message"]
-                elif facts.get("task_clock"):
+                elif facts.get("workflow_time_missing") or (
+                    _workflow_time_is_unset(message) and _workflow_arrangement_requested(message)
+                ):
+                    reply = "我可以继续安排。你提到具体时间还没定，我不会默认成立即开始；希望安排在具体哪天几点？"
+                elif facts.get("billing") and _billing_query_requested(message):
+                    report = facts["billing"]
+                    requested_category = _requested_billing_category(message, report["categories"])
+                    if requested_category:
+                        match = next(
+                            (row for row in report["categories"] if row["category"] == requested_category),
+                            None,
+                        )
+                        if match:
+                            reply = f"{report['start']} 至 {report['end']}，{requested_category}分类净支出为 {_money(match['amount_minor'])}。"
+                        else:
+                            reply = f"账单分类没有“{requested_category}”的独立汇总，现有净支出总额不能直接当作该项金额。"
+                    else:
+                        reply = _billing_report_reply(report)
+                elif facts.get("task_clock") and _clock_query_requested(message):
                     reply = "当前安排使用的模拟时间是北京时间 " + facts["task_clock"]["now_beijing"] + "。"
-                elif facts.get("workflow_clock"):
+                elif facts.get("workflow_clock") and _clock_query_requested(message):
                     reply = "当前生活安排使用的模拟时间是北京时间 " + facts["workflow_clock"]["now_beijing"] + "。"
-                elif facts.get("workflow_catalog"):
+                elif facts.get("workflow_catalog") and _workflow_catalog_requested(message):
                     catalog = facts["workflow_catalog"]
                     rows = "\n".join(
                         f"| {item['merchant_name']} | {item['name']} | {_money(item['price_minor'])} | 每项1至5份 |"
@@ -974,18 +998,6 @@ class BankingAgent:
                             )
                             + " 申购与赎回按业务日 T+1 结算，受理不等于持仓入账或现金到账。"
                         )
-                elif facts.get("billing"):
-                    report = facts["billing"]
-                    rows = "\n".join(
-                        f"| {c['category']} | {_money(c['amount_minor'])} |" for c in report["categories"]
-                    )
-                    reply = (
-                        f"{report['start']} 至 {report['end']}：收入 {_money(report['income_minor'])}，"
-                        f"净支出 {_money(report['net_expense_minor'])}（已减退款 {_money(report['refund_minor'])}）。"
-                        f"\n\n| 分类 | 净支出 |\n| --- | ---: |\n{rows}\n\n{report['source_notice']}"
-                    )
-                    if report["anomalies"]:
-                        reply += "\n\n需留意：" + "；".join(a["reason"] for a in report["anomalies"][:3])
                 elif (
                     facts.get("accounts")
                     and balance_question
@@ -1048,6 +1060,58 @@ class BankingAgent:
 
 def _money(minor: int) -> str:
     return f"¥{Decimal(minor) / Decimal(100):,.2f}"
+
+
+def _billing_query_requested(message: str) -> bool:
+    return bool(re.search(r"账单|流水|支出|收入|收支|消费|花了多少|花费|外卖|餐饮", message))
+
+
+def _requested_billing_category(message: str, categories: list[dict]) -> str | None:
+    normalized = unicodedata.normalize("NFKC", message).casefold()
+    for row in categories:
+        category = str(row.get("category", ""))
+        if category and category.casefold() in normalized:
+            return category
+    # Do not map a merchant/service label such as takeaway to aggregate spend.
+    if "外卖" in normalized:
+        return "外卖"
+    return None
+
+
+def _billing_report_reply(report: dict) -> str:
+    rows = "\n".join(
+        f"| {c['category']} | {_money(c['amount_minor'])} |" for c in report["categories"]
+    )
+    reply = (
+        f"{report['start']} 至 {report['end']}：收入 {_money(report['income_minor'])}，"
+        f"净支出 {_money(report['net_expense_minor'])}（已减退款 {_money(report['refund_minor'])}）。"
+        f"\n\n| 分类 | 净支出 |\n| --- | ---: |\n{rows}\n\n{report['source_notice']}"
+    )
+    if report["anomalies"]:
+        reply += "\n\n需留意：" + "；".join(a["reason"] for a in report["anomalies"][:3])
+    return reply
+
+
+def _clock_query_requested(message: str) -> bool:
+    return bool(re.search(r"现在几点|当前时间|模拟时间|现在的时间|今天几号|今天日期|几点了", message))
+
+
+def _workflow_catalog_requested(message: str) -> bool:
+    return bool(re.search(
+        r"有哪些(?:.{0,8})服务|生活服务.{0,8}(?:可以|能).{0,4}安排|服务目录|有什么服务|服务有哪些|可选服务|服务单价|服务价格",
+        message,
+    ))
+
+
+def _workflow_arrangement_requested(message: str) -> bool:
+    return bool(re.search(r"安排|准备|预订|订.{0,4}(?:花|蛋糕|服务)|鲜花|花束|蛋糕", message))
+
+
+def _workflow_time_is_unset(message: str) -> bool:
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", message))
+    return bool(
+        re.search(r"(?:具体)?时间(?:还)?(?:没定|未定|待定|不确定)|还没确定时间|时间没有定", compact)
+    )
 
 
 def _workflow_requested_immediately(message: str) -> bool:
