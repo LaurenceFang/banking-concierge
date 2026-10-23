@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import hashlib
+import json
 import re
 import unicodedata
 from collections import defaultdict
@@ -23,7 +24,15 @@ from sqlalchemy.pool import StaticPool
 
 from app.bank import BankError
 
-from .models import Base, RenewalNotification, SubscriptionActionPlan, SubscriptionContract
+from .models import (
+    Base,
+    PersonalRenewalNotification,
+    PersonalSubscriptionRecord,
+    RenewalNotification,
+    SubscriptionActionPlan,
+    SubscriptionCandidateFeedback,
+    SubscriptionContract,
+)
 
 PLAN_TTL = timedelta(minutes=10)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -86,6 +95,9 @@ for _canonical, _values in {
 
 _KNOWN_CONTRACT_MERCHANTS = {row["merchant"] for row in DEMO_CONTRACTS}
 _RENT_TERMS = ("公寓", "房租", "租金", "月租", "apartment", "rent")
+_PERSONAL_OWNER_ID = "demo-user-001"
+_PERSONAL_CYCLES = {"weekly", "monthly", "quarterly", "yearly"}
+_PERSONAL_FEEDBACK = {"confirmed", "not_subscription", "ignored"}
 
 
 class SubscriptionService:
@@ -253,13 +265,237 @@ class SubscriptionService:
         entries: Iterable[dict[str, Any]],
         as_of: date | datetime | str | None = None,
     ) -> dict[str, Any]:
+        current_entries = list(entries)
+        candidates = self.detect(current_entries, as_of=as_of)
         with self._session_factory() as session:
             contracts = session.scalars(
                 select(SubscriptionContract).order_by(SubscriptionContract.merchant)
             ).all()
+            personal = session.scalars(
+                select(PersonalSubscriptionRecord)
+                .where(
+                    PersonalSubscriptionRecord.owner_id == _PERSONAL_OWNER_ID,
+                    PersonalSubscriptionRecord.active.is_(True),
+                )
+                .order_by(PersonalSubscriptionRecord.next_charge_on, PersonalSubscriptionRecord.name)
+            ).all()
+            feedback_rows = session.scalars(select(SubscriptionCandidateFeedback)).all()
+            feedback = {(row.merchant_key, row.cycle): row for row in feedback_rows}
+            entry_map = {str(row.get("id")): row for row in current_entries if row.get("id") is not None}
+            for candidate in candidates:
+                identity = _candidate_identity(candidate["merchant"], candidate["cycle"])
+                row = feedback.get(identity)
+                candidate["feedback"] = row.feedback if row is not None else None
+                candidate["feedback_version"] = row.version if row is not None else 0
+                candidate["personal_record_id"] = row.personal_record_id if row is not None else None
+                candidate["evidence_entries"] = [
+                    {
+                        "id": entry["id"],
+                        "date": entry.get("date"),
+                        "merchant": entry.get("merchant"),
+                        "amount_minor": entry.get("amount_minor"),
+                        "source": entry.get("source"),
+                        "category": entry.get("category"),
+                    }
+                    for entry_id in candidate["entry_ids"]
+                    if (entry := entry_map.get(entry_id)) is not None
+                ]
             return {
                 "subscriptions": [_contract_dict(contract) for contract in contracts],
-                "candidates": self.detect(entries, as_of=as_of),
+                "personal_records": [_personal_record_dict(row) for row in personal],
+                "candidates": candidates,
+            }
+
+    def create_personal_record(
+        self,
+        name: str,
+        amount_minor: int,
+        cycle: str,
+        next_charge_on: date | str,
+        category: str = "",
+        note: str = "",
+        reminder_enabled: bool = True,
+        lead_days: int = 3,
+        *,
+        client_request_id: str,
+        candidate_id: str | None = None,
+        current_entries: Iterable[dict[str, Any]] = (),
+    ) -> dict[str, Any]:
+        values = _validate_personal_record(
+            name, amount_minor, cycle, next_charge_on, category, note, reminder_enabled, lead_days
+        )
+        request_id = client_request_id.strip() if isinstance(client_request_id, str) else ""
+        if not request_id or len(request_id) > 120:
+            raise BankError("INVALID_REQUEST_ID", "请刷新后重试，订阅记录请求标识无效。")
+        candidate = _find_current_candidate(candidate_id, current_entries, self.detect) if candidate_id else None
+        merchant_key = _normalize_merchant(candidate["merchant"]) if candidate is not None else None
+        candidate_cycle = candidate["cycle"] if candidate is not None else None
+        request_payload = {
+            **{key: str(value) if isinstance(value, date) else value for key, value in values.items()},
+            "candidate_identity": f"{merchant_key}|{candidate_cycle}"
+            if merchant_key and candidate_cycle else None,
+        }
+        now = _utcnow()
+        with self._transaction() as session:
+            previous = session.scalar(
+                select(PersonalSubscriptionRecord).where(
+                    PersonalSubscriptionRecord.owner_id == _PERSONAL_OWNER_ID,
+                    PersonalSubscriptionRecord.client_request_id == request_id,
+                )
+            )
+            if previous is not None:
+                if _personal_request_payload(previous) != request_payload:
+                    raise BankError("PERSONAL_SUBSCRIPTION_REQUEST_CONFLICT", "该保存请求已用于其他记录，请重新提交。")
+                return _personal_record_dict(previous)
+            if merchant_key is not None and candidate_cycle is not None:
+                state = session.get(SubscriptionCandidateFeedback, (merchant_key, candidate_cycle))
+                if state is not None and state.personal_record_id is not None:
+                    existing = session.get(PersonalSubscriptionRecord, state.personal_record_id)
+                    if existing is not None and existing.active:
+                        if _personal_request_payload(existing) == request_payload:
+                            return _personal_record_dict(existing)
+                        raise BankError("CANDIDATE_ALREADY_RECORDED", "该周期记录已添加；请编辑个人订阅以更新它。")
+            record = PersonalSubscriptionRecord(
+                id=f"personal-subscription-{uuid4().hex}",
+                owner_id=_PERSONAL_OWNER_ID,
+                **values,
+                version=1,
+                client_request_id=request_id,
+                candidate_merchant_key=merchant_key,
+                candidate_cycle=candidate_cycle,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(record)
+            session.flush()
+            if merchant_key is not None and candidate_cycle is not None:
+                state = session.get(SubscriptionCandidateFeedback, (merchant_key, candidate_cycle))
+                if state is None:
+                    state = SubscriptionCandidateFeedback(
+                        merchant_key=merchant_key,
+                        cycle=candidate_cycle,
+                        merchant=candidate["merchant"],
+                        feedback="confirmed",
+                        personal_record_id=record.id,
+                        client_request_id=request_id,
+                        request_payload=json.dumps(request_payload, sort_keys=True, ensure_ascii=False),
+                        version=1,
+                        updated_at=now,
+                    )
+                    session.add(state)
+                else:
+                    state.feedback = "confirmed"
+                    state.personal_record_id = record.id
+                    state.client_request_id = request_id
+                    state.request_payload = json.dumps(request_payload, sort_keys=True, ensure_ascii=False)
+                    state.version += 1
+                    state.updated_at = now
+            session.flush()
+            return _personal_record_dict(record)
+
+    def update_personal_record(self, identity: str, *, version: int, **changes: Any) -> dict[str, Any]:
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise BankError("INVALID_RECORD_VERSION", "请提供有效的个人订阅版本号。")
+        with self._transaction() as session:
+            record = session.get(PersonalSubscriptionRecord, identity)
+            if record is None or record.owner_id != _PERSONAL_OWNER_ID or not record.active:
+                raise BankError("PERSONAL_SUBSCRIPTION_NOT_FOUND", "未找到有效的个人订阅记录。")
+            if record.version != version:
+                raise BankError("PERSONAL_SUBSCRIPTION_VERSION_CONFLICT", "记录已更新，请刷新后再编辑。")
+            fields = {
+                "name": record.name,
+                "amount_minor": record.amount_minor,
+                "cycle": record.cycle,
+                "next_charge_on": record.next_charge_on,
+                "category": record.category,
+                "note": record.note,
+                "reminder_enabled": record.reminder_enabled,
+                "lead_days": record.lead_days,
+            }
+            for key in fields:
+                if key in changes:
+                    fields[key] = changes[key]
+            fields = _validate_personal_record(**fields)
+            for key, value in fields.items():
+                setattr(record, key, value)
+            record.version += 1
+            record.updated_at = _utcnow()
+            session.flush()
+            return _personal_record_dict(record)
+
+    def remove_personal_record(self, identity: str, *, version: int) -> dict[str, Any]:
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise BankError("INVALID_RECORD_VERSION", "请提供有效的个人订阅版本号。")
+        now = _utcnow()
+        with self._transaction() as session:
+            record = session.get(PersonalSubscriptionRecord, identity)
+            if record is None or record.owner_id != _PERSONAL_OWNER_ID:
+                raise BankError("PERSONAL_SUBSCRIPTION_NOT_FOUND", "未找到个人订阅记录。")
+            if not record.active:
+                return {"removed": True, "record": _personal_record_dict(record)}
+            if record.version != version:
+                raise BankError("PERSONAL_SUBSCRIPTION_VERSION_CONFLICT", "记录已更新，请刷新后再移除。")
+            record.active = False
+            record.reminder_enabled = False
+            record.version += 1
+            record.updated_at = now
+            if record.candidate_merchant_key and record.candidate_cycle:
+                state = session.get(
+                    SubscriptionCandidateFeedback, (record.candidate_merchant_key, record.candidate_cycle)
+                )
+                if state is not None and state.personal_record_id == record.id:
+                    state.feedback = "reset"
+                    state.personal_record_id = None
+                    state.version += 1
+                    state.updated_at = now
+            session.flush()
+            return {"removed": True, "record": _personal_record_dict(record)}
+
+    def set_candidate_feedback(
+        self,
+        candidate_id: str,
+        feedback: str,
+        current_entries: Iterable[dict[str, Any]],
+        *,
+        version: int,
+    ) -> dict[str, Any]:
+        if feedback not in {*_PERSONAL_FEEDBACK, "reset"}:
+            raise BankError("INVALID_CANDIDATE_FEEDBACK", "请选择有效的候选处理方式。")
+        candidates = self.detect(list(current_entries))
+        candidate = next((item for item in candidates if item["id"] == candidate_id), None)
+        if candidate is None:
+            raise BankError("SUBSCRIPTION_CANDIDATE_NOT_FOUND", "账单依据已变化，请刷新候选再操作。")
+        merchant_key = _normalize_merchant(candidate["merchant"])
+        cycle = candidate["cycle"]
+        now = _utcnow()
+        with self._transaction() as session:
+            state = session.get(SubscriptionCandidateFeedback, (merchant_key, cycle))
+            current_version = state.version if state is not None else 0
+            if version != current_version:
+                raise BankError("CANDIDATE_FEEDBACK_VERSION_CONFLICT", "候选处理状态已改变，请刷新后重试。")
+            if feedback == "reset":
+                if state is not None and state.personal_record_id is not None:
+                    raise BankError("CANDIDATE_HAS_PERSONAL_RECORD", "请先移除关联的个人订阅记录，再重置候选。")
+                if state is not None:
+                    session.delete(state)
+                session.flush()
+                return {"merchant": candidate["merchant"], "cycle": cycle, "feedback": None, "version": 0}
+            if state is None:
+                state = SubscriptionCandidateFeedback(
+                    merchant_key=merchant_key, cycle=cycle, merchant=candidate["merchant"],
+                    feedback=feedback, version=1, updated_at=now,
+                )
+                session.add(state)
+            else:
+                if state.personal_record_id is not None and feedback != "confirmed":
+                    raise BankError("CANDIDATE_HAS_PERSONAL_RECORD", "请先移除关联的个人订阅记录，再修改候选。")
+                state.feedback = feedback
+                state.version += 1
+                state.updated_at = now
+            session.flush()
+            return {
+                "merchant": candidate["merchant"], "cycle": cycle,
+                "feedback": state.feedback, "version": state.version,
             }
 
     def create_action_plan(
@@ -467,7 +703,16 @@ class SubscriptionService:
                     RenewalNotification.created_at, RenewalNotification.id
                 )
             ).all()
-            return [_notification_dict(row) for row in rows]
+            personal = session.scalars(
+                select(PersonalRenewalNotification).order_by(
+                    PersonalRenewalNotification.created_at, PersonalRenewalNotification.id
+                )
+            ).all()
+            return sorted(
+                [_notification_dict(row) for row in rows]
+                + [_personal_notification_dict(row) for row in personal],
+                key=lambda item: (item["created_at"], item["id"]),
+            )
 
     def renewal_notifications(
         self,
@@ -477,7 +722,6 @@ class SubscriptionService:
     ) -> list[dict[str, Any]]:
         """Persist and return newly due demo-contract reminders; never charge an account."""
 
-        del entries  # Bill evidence is used for candidates, never to authorize contract reminders.
         if isinstance(window_days, bool) or not isinstance(window_days, int) or window_days < 0:
             raise BankError("INVALID_WINDOW", "续费提醒窗口必须是大于或等于零的整数天。")
         today = _as_local_date(as_of) if as_of is not None else datetime.now(SHANGHAI).date()
@@ -519,6 +763,37 @@ class SubscriptionService:
                 session.add(row)
                 session.flush()
                 created.append(_notification_dict(row))
+            # User-entered reminders are informational only; they never create
+            # contracts, authorization plans, or bank transactions.
+            personal = session.scalars(
+                select(PersonalSubscriptionRecord).where(
+                    PersonalSubscriptionRecord.owner_id == _PERSONAL_OWNER_ID,
+                    PersonalSubscriptionRecord.active.is_(True),
+                    PersonalSubscriptionRecord.reminder_enabled.is_(True),
+                ).order_by(PersonalSubscriptionRecord.next_charge_on, PersonalSubscriptionRecord.id)
+            ).all()
+            for record in personal:
+                if record.next_charge_on < today or record.next_charge_on > today + timedelta(days=record.lead_days):
+                    continue
+                notification_id = f"personal-renewal-{record.id}-{record.next_charge_on.isoformat()}"
+                if session.get(PersonalRenewalNotification, notification_id) is not None:
+                    continue
+                title = f"{record.name}个人续费提醒"
+                text = (
+                    f"你记录的{record.name}预计于{record.next_charge_on.isoformat()}续费，"
+                    f"金额为{_format_cny(record.amount_minor)}。这是个人提醒，不会自动扣款。"
+                )
+                row = PersonalRenewalNotification(
+                    id=notification_id,
+                    subscription_id=record.id,
+                    next_charge_on=record.next_charge_on,
+                    title=title,
+                    text=text,
+                    created_at=now,
+                )
+                session.add(row)
+                session.flush()
+                created.append(_personal_notification_dict(row))
         return created
 
     def _get_plan_for_update(self, session: Session, plan_id: str) -> SubscriptionActionPlan | None:
@@ -895,4 +1170,122 @@ def _notification_dict(row: RenewalNotification) -> dict[str, Any]:
         "created_at": _iso_utc(row.created_at),
         "subscription_id": row.subscription_id,
         "next_charge_on": row.next_charge_on.isoformat(),
+    }
+
+
+def _personal_notification_dict(row: PersonalRenewalNotification) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "title": row.title,
+        "text": row.text,
+        "kind": row.kind,
+        "source": row.source,
+        "created_at": _iso_utc(row.created_at),
+        "subscription_id": row.subscription_id,
+        "next_charge_on": row.next_charge_on.isoformat(),
+    }
+
+
+def _candidate_identity(merchant: str, cycle: str) -> tuple[str, str]:
+    return (_normalize_merchant(merchant), cycle)
+
+
+def _find_current_candidate(candidate_id, current_entries, detector):
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise BankError("SUBSCRIPTION_CANDIDATE_NOT_FOUND", "请先刷新周期识别结果。")
+    candidate = next(
+        (row for row in detector(list(current_entries)) if row["id"] == candidate_id),
+        None,
+    )
+    if candidate is None:
+        raise BankError("SUBSCRIPTION_CANDIDATE_NOT_FOUND", "账单依据已变化，请刷新候选再操作。")
+    return candidate
+
+
+def _validate_personal_record(
+    name,
+    amount_minor,
+    cycle,
+    next_charge_on,
+    category="",
+    note="",
+    reminder_enabled=True,
+    lead_days=3,
+):
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 160:
+        raise BankError("INVALID_PERSONAL_SUBSCRIPTION", "名称须为1至160个字符。")
+    if isinstance(amount_minor, bool) or not isinstance(amount_minor, int) or not 0 < amount_minor <= 9_007_199_254_740_991:
+        raise BankError("INVALID_PERSONAL_SUBSCRIPTION_AMOUNT", "金额须为大于零的整数分。")
+    if cycle not in _PERSONAL_CYCLES:
+        raise BankError("INVALID_PERSONAL_SUBSCRIPTION_CYCLE", "请选择周、月、季或年周期。")
+    if isinstance(next_charge_on, datetime):
+        parsed_date = next_charge_on.date()
+    elif isinstance(next_charge_on, date):
+        parsed_date = next_charge_on
+    elif isinstance(next_charge_on, str):
+        try:
+            parsed_date = date.fromisoformat(next_charge_on)
+        except ValueError:
+            parsed_date = None
+    else:
+        parsed_date = None
+    if parsed_date is None:
+        raise BankError("INVALID_PERSONAL_SUBSCRIPTION_DATE", "续费日期无效，请使用YYYY-MM-DD。")
+    if not isinstance(category, str) or len(category.strip()) > 80:
+        raise BankError("INVALID_PERSONAL_SUBSCRIPTION_CATEGORY", "分类不能超过80个字符。")
+    if not isinstance(note, str) or len(note.strip()) > 500:
+        raise BankError("INVALID_PERSONAL_SUBSCRIPTION_NOTE", "备注不能超过500个字符。")
+    if not isinstance(reminder_enabled, bool):
+        raise BankError("INVALID_PERSONAL_SUBSCRIPTION_REMINDER", "提醒开关无效。")
+    if isinstance(lead_days, bool) or not isinstance(lead_days, int) or not 0 <= lead_days <= 30:
+        raise BankError("INVALID_PERSONAL_SUBSCRIPTION_LEAD_DAYS", "提醒提前天数须为0至30天。")
+    return {
+        "name": name.strip(),
+        "amount_minor": amount_minor,
+        "cycle": cycle,
+        "next_charge_on": parsed_date,
+        "category": category.strip(),
+        "note": note.strip(),
+        "reminder_enabled": reminder_enabled,
+        "lead_days": lead_days,
+    }
+
+
+def _personal_request_payload(record: PersonalSubscriptionRecord) -> dict[str, Any]:
+    identity = (
+        f"{record.candidate_merchant_key}|{record.candidate_cycle}"
+        if record.candidate_merchant_key and record.candidate_cycle else None
+    )
+    return {
+        "name": record.name,
+        "amount_minor": record.amount_minor,
+        "cycle": record.cycle,
+        "next_charge_on": record.next_charge_on.isoformat(),
+        "category": record.category,
+        "note": record.note,
+        "reminder_enabled": record.reminder_enabled,
+        "lead_days": record.lead_days,
+        "candidate_identity": identity,
+    }
+
+
+def _personal_record_dict(record: PersonalSubscriptionRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "name": record.name,
+        "amount_minor": record.amount_minor,
+        "currency": record.currency,
+        "cycle": record.cycle,
+        "next_charge_on": record.next_charge_on.isoformat(),
+        "category": record.category,
+        "note": record.note,
+        "reminder_enabled": record.reminder_enabled,
+        "lead_days": record.lead_days,
+        "active": record.active,
+        "version": record.version,
+        "source": "personal_record",
+        "candidate_merchant_key": record.candidate_merchant_key,
+        "candidate_cycle": record.candidate_cycle,
+        "created_at": _iso_utc(record.created_at),
+        "updated_at": _iso_utc(record.updated_at),
     }

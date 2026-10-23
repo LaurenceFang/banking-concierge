@@ -87,6 +87,9 @@ def test_subscription_tables_are_separate_from_the_bank_ledger(tmp_path):
             "subscription_action_plans",
             "subscription_contracts",
             "subscription_renewal_notifications",
+            "personal_subscription_records",
+            "personal_subscription_notifications",
+            "subscription_candidate_feedback",
         }
         assert not any(name.startswith("bank_") for name in names)
     finally:

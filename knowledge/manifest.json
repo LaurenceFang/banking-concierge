@@ -2,8 +2,8 @@
   "schema_version": "1.0.0",
   "knowledge_base": "banking-concierge-demo",
   "documents": [
-    {"doc_id": "demo-faq", "path": "seed/业务FAQ.md", "source": "project_authored_simulation", "version": "0.3", "category": "business_faq", "scope": "demo_public", "status": "draft", "valid_from": "2026-10-12"},
-    {"doc_id": "demo-guidance", "path": "seed/产品与操作说明.md", "source": "project_authored_simulation", "version": "0.3", "category": "product_and_operation", "scope": "demo_public", "status": "draft", "valid_from": "2026-10-12"},
-    {"doc_id": "demo-errors", "path": "seed/故障帮助.md", "source": "project_authored_simulation", "version": "0.3", "category": "recovery_help", "scope": "demo_public", "status": "draft", "valid_from": "2026-10-12"}
+    {"doc_id": "demo-faq", "path": "seed/业务FAQ.md", "source": "project_authored_simulation", "version": "0.4", "category": "business_faq", "scope": "demo_public", "status": "draft", "valid_from": "2026-10-24"},
+    {"doc_id": "demo-guidance", "path": "seed/产品与操作说明.md", "source": "project_authored_simulation", "version": "0.4", "category": "product_and_operation", "scope": "demo_public", "status": "draft", "valid_from": "2026-10-24"},
+    {"doc_id": "demo-errors", "path": "seed/故障帮助.md", "source": "project_authored_simulation", "version": "0.4", "category": "recovery_help", "scope": "demo_public", "status": "draft", "valid_from": "2026-10-24"}
   ]
 }

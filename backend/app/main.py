@@ -11,7 +11,7 @@ from threading import RLock
 from typing import Literal
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,7 +25,11 @@ from .config import MODEL, ROOT, database_url
 from .conversations import ConversationError, ConversationStore
 from .knowledge.service import KnowledgeService
 from .llm import DeepSeekClient, ModelError
+from .management_routes import management_router
 from .pin_routes import conversation_pin_router
+from .plan_routes import plan_revision_router
+from .preference_routes import preference_router
+from .record_routes import record_router
 from .subscriptions import SubscriptionService
 from .task_clock import TaskClock
 from .task_routes import task_router, workflow_router
@@ -58,6 +62,7 @@ class ThreadRequest(BaseModel):
 class ImportRequest(BaseModel):
     filename: str = Field(default="账单.csv", max_length=200)
     content: str = Field(max_length=2 * 1024 * 1024)
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class SubscriptionRequest(BaseModel):
@@ -103,6 +108,7 @@ def create_app(
     enable_workflow_actions: bool = False,
     task_poll_seconds: float = 2.0,
     workflow_fault_mode: str | None = None,
+    contextual_knowledge: bool = True,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -155,8 +161,11 @@ def create_app(
             wealth,
             tasks=tasks,
             task_clock=task_clock,
+            workflows=workflows,
             enable_p3_actions=enable_p3_actions,
             enable_tasks_actions=enable_tasks_actions,
+            enable_workflow_actions=enable_workflow_actions,
+            contextual_knowledge=contextual_knowledge,
         )
         stop = asyncio.Event()
         async def background():
@@ -194,7 +203,7 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
-        allow_methods=["GET", "POST", "PATCH"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "PUT"],
         allow_headers=["Content-Type"],
     )
     app.include_router(conversation_pin_router(app))
@@ -347,18 +356,25 @@ def create_app(
         return {"notifications": app.state.store.notifications()}
 
     @app.get("/api/billing/report")
-    def billing_report(start: str | None = None, end: str | None = None):
-        return app.state.billing.report(start, end)
+    def billing_report(start: str | None = None, end: str | None = None,
+                       query: str = Query(default="", max_length=160),
+                       category: str | None = Query(default=None, max_length=80),
+                       source: str | None = None):
+        return app.state.billing.report(start, end, query=query, category=category, source=source)
 
     @app.get("/api/billing/entries")
-    def billing_entries(start: str | None = None, end: str | None = None):
-        return {"entries": app.state.billing.entries(start, end)}
+    def billing_entries(start: str | None = None, end: str | None = None,
+                        query: str = Query(default="", max_length=160),
+                        category: str | None = Query(default=None, max_length=80),
+                        source: str | None = None):
+        return {"entries": app.state.billing.entries(start, end, query=query, category=category, source=source)}
 
     @app.post("/api/billing/import")
     def billing_import(request: ImportRequest):
         if len(request.content.encode("utf-8")) > 2 * 1024 * 1024:
             raise HTTPException(413, detail={"code": "FILE_TOO_LARGE", "message": "账单请控制在 2MB 以内。"})
-        return app.state.billing.import_csv(request.content, request.filename)
+        return app.state.billing.import_csv(request.content, request.filename,
+                                           client_request_id=request.client_request_id)
 
     @app.get("/api/billing/sample")
     def billing_sample():
@@ -420,17 +436,25 @@ def create_app(
     def decide_domain(identity, service, request):
         plan = service.get_plan(identity)
         check_scope(plan, request.conversation_id)
-        result = service.decide_plan(identity, request.decision)
+        if service is app.state.workflows:
+            result = service.decide_plan(identity, request.decision, request.conversation_id)
+        else:
+            result = service.decide_plan(identity, request.decision)
         if plan and plan.get("conversation_id"):
             result["conversation_id"] = plan["conversation_id"]
         app.state.store.note_decision(identity, result["message"], result)
         sync_events()
         return result
 
+    app.include_router(management_router(app, workflows_enabled=enable_workflow_actions))
+    app.include_router(record_router(app))
+    app.include_router(preference_router(app))
+
     if enable_tasks_actions:
         app.include_router(task_router(app, preview_domain, decide_domain))
     if enable_workflow_actions:
         app.include_router(workflow_router(app, preview_domain, decide_domain))
+        app.include_router(plan_revision_router(app, preview_domain))
 
     @app.get("/api/cards")
     def cards_list():
@@ -636,4 +660,4 @@ def create_app(
     return app
 
 
-app = create_app(enable_p3_actions=True, enable_tasks_actions=True)
+app = create_app(enable_p3_actions=True, enable_tasks_actions=True, enable_workflow_actions=True)

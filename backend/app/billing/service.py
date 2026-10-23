@@ -14,8 +14,9 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, delete, func, inspect, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -23,7 +24,15 @@ from sqlalchemy.pool import StaticPool
 
 from ..bank.models import Account, LedgerTransaction
 from ..bank.service import DEMO_USER_ID
-from .models import BillingBase, BillingRecord
+from .models import (
+    BillingAnnotation,
+    BillingBase,
+    BillingCategoryRule,
+    BillingImportBatch,
+    BillingImportBatchEntry,
+    BillingManualRecord,
+    BillingRecord,
+)
 
 MAX_IMPORT_BYTES = 2 * 1024 * 1024
 MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
@@ -321,6 +330,7 @@ class BillingService:
             # separate source partition and are never touched here.
             for record in existing:
                 if record.source_key not in wanted_keys:
+                    session.delete(session.get(BillingAnnotation, record.id))
                     session.delete(record)
 
             session.flush()
@@ -333,7 +343,14 @@ class BillingService:
                     for field, value in values.items():
                         setattr(record, field, value)
 
-    def entries(self, start: str | date | None = None, end: str | date | None = None) -> list[dict[str, Any]]:
+    def entries(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        query: str = "",
+        category: str | None = None,
+        source: str | None = None,
+    ) -> list[dict[str, Any]]:
         start_date = _parse_filter_date(start, "start") if start is not None else None
         end_date = _parse_filter_date(end, "end") if end is not None else None
         if start_date is not None and end_date is not None and start_date > end_date:
@@ -343,27 +360,504 @@ class BillingService:
             records = session.scalars(
                 select(BillingRecord).order_by(BillingRecord.date, BillingRecord.id)
             ).all()
+            manual = session.scalars(
+                select(BillingManualRecord).order_by(BillingManualRecord.date, BillingManualRecord.id)
+            ).all()
             result = [_record_entry(record) for record in records]
+            result.extend(_manual_entry(record) for record in manual)
             result.extend(self._bank_entries(session))
+            annotations = {item.entry_id: item for item in session.scalars(select(BillingAnnotation)).all()}
+            result = [_apply_annotation(row, annotations.get(row["id"])) for row in result]
+            rules = session.scalars(
+                select(BillingCategoryRule).order_by(
+                    BillingCategoryRule.effective_from.desc(),
+                    BillingCategoryRule.created_at.desc(),
+                    BillingCategoryRule.id,
+                )
+            ).all()
+            result = [_apply_category_rule(row, rules) for row in result]
 
         if start_date is not None:
             result = [entry for entry in result if date.fromisoformat(entry["date"]) >= start_date]
         if end_date is not None:
             result = [entry for entry in result if date.fromisoformat(entry["date"]) <= end_date]
+        needle = query.strip().casefold()
+        if needle:
+            result = [
+                entry
+                for entry in result
+                if needle
+                in " ".join(
+                    str(entry.get(key) or "")
+                    for key in (
+                        "merchant",
+                        "raw_merchant",
+                        "category",
+                        "note",
+                        "tags",
+                        "account_id",
+                        "reason",
+                    )
+                ).casefold()
+            ]
+        if category:
+            result = [entry for entry in result if entry["category"] == category]
+        if source:
+            result = [entry for entry in result if entry["source"] == source]
         return sorted(result, key=lambda entry: (entry["date"], entry["source"], entry["id"]))
 
-    def report(self, start: str | date | None = None, end: str | date | None = None) -> dict[str, Any]:
+    def list_category_rules(self) -> list[dict[str, Any]]:
+        """Return the user's explicit merchant classification rules."""
+        with self._session_factory() as session:
+            rules = session.scalars(
+                select(BillingCategoryRule).order_by(
+                    BillingCategoryRule.merchant_key,
+                    BillingCategoryRule.effective_from.desc(),
+                    BillingCategoryRule.id,
+                )
+            ).all()
+            return [_category_rule_dict(rule) for rule in rules]
+
+    def create_category_rule(
+        self,
+        *,
+        client_request_id: str,
+        merchant: str,
+        category: str,
+        effective_from: str | date,
+        transaction_kind: str | None = None,
+        note_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an explicit, exact merchant rule; identical retries are idempotent."""
+        request_id = _billing_request_id(client_request_id)
+        merchant_display = _billing_merchant(merchant)
+        merchant_key = _category_merchant_key(merchant_display)
+        category_value = _billing_category(category)
+        kind_value = _validated_kind(transaction_kind) if transaction_kind else None
+        note_value = _category_rule_note(note_contains)
+        effective_date = _parse_filter_date(effective_from, "effective_from")
+        payload = _category_rule_payload(
+            merchant_display, category_value, kind_value, note_value, effective_date
+        )
+        now = datetime.now(UTC)
+        model = BillingCategoryRule(
+            id=f"crule-{uuid4().hex}",
+            client_request_id=request_id,
+            request_payload_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            merchant=merchant_display,
+            merchant_key=merchant_key,
+            category=category_value,
+            transaction_kind=kind_value,
+            kind_match_key=kind_value or "",
+            note_contains=note_value,
+            note_condition_key=_category_rule_note_key(note_value),
+            effective_from=effective_date,
+            version=1,
+            created_at=now,
+            updated_at=now,
+        )
+        try:
+            with self._write_transaction() as session:
+                existing = session.scalar(
+                    select(BillingCategoryRule).where(
+                        BillingCategoryRule.client_request_id == request_id
+                    )
+                )
+                if existing is not None:
+                    return _idempotent_category_rule(existing, payload)
+                session.add(model)
+                session.flush()
+                return _category_rule_dict(model)
+        except IntegrityError as error:
+            with self._session_factory() as session:
+                existing = session.scalar(
+                    select(BillingCategoryRule).where(
+                        BillingCategoryRule.client_request_id == request_id
+                    )
+                )
+                if existing is not None:
+                    return _idempotent_category_rule(existing, payload)
+            raise BillingError(
+                "CATEGORY_RULE_EXISTS", "相同条件和生效日期的分类规则已存在。"
+            ) from error
+
+    def update_category_rule(
+        self, rule_id: str, version: int, **changes: Any
+    ) -> dict[str, Any]:
+        """Update a rule using optimistic version checks."""
+        allowed = {"merchant", "category", "transaction_kind", "note_contains", "effective_from"}
+        if not changes or set(changes) - allowed:
+            raise BillingError("INVALID_CATEGORY_RULE_UPDATE", "没有可保存的规则修改。")
+        if not isinstance(version, int) or version < 1:
+            raise BillingError("INVALID_VERSION", "规则版本无效，请刷新后重试。")
+
+        normalized: dict[str, Any] = {}
+        if "merchant" in changes:
+            normalized["merchant"] = _billing_merchant(changes["merchant"])
+            normalized["merchant_key"] = _category_merchant_key(normalized["merchant"])
+        if "category" in changes:
+            normalized["category"] = _billing_category(changes["category"])
+        if "transaction_kind" in changes:
+            normalized["transaction_kind"] = (
+                _validated_kind(changes["transaction_kind"]) if changes["transaction_kind"] else None
+            )
+        if "note_contains" in changes:
+            normalized["note_contains"] = _category_rule_note(changes["note_contains"])
+        if "effective_from" in changes:
+            normalized["effective_from"] = _parse_filter_date(changes["effective_from"], "effective_from")
+        if "transaction_kind" in normalized:
+            normalized["kind_match_key"] = normalized["transaction_kind"] or ""
+        if "note_contains" in normalized:
+            normalized["note_condition_key"] = _category_rule_note_key(normalized["note_contains"])
+        normalized["version"] = version + 1
+        normalized["updated_at"] = datetime.now(UTC)
+
+        try:
+            with self._write_transaction() as session:
+                result = session.execute(
+                    update(BillingCategoryRule)
+                    .where(BillingCategoryRule.id == rule_id, BillingCategoryRule.version == version)
+                    .values(**normalized)
+                )
+                if result.rowcount != 1:
+                    existing = session.get(BillingCategoryRule, rule_id)
+                    if existing is None:
+                        raise BillingError("CATEGORY_RULE_NOT_FOUND", "未找到该个人分类规则。")
+                    raise BillingError("VERSION_CONFLICT", "分类规则已在其他位置更新，请刷新后再修改。")
+                updated = session.get(BillingCategoryRule, rule_id)
+                assert updated is not None
+                return _category_rule_dict(updated)
+        except IntegrityError as error:
+            raise BillingError(
+                "CATEGORY_RULE_EXISTS", "相同条件和生效日期的分类规则已存在。"
+            ) from error
+
+    def delete_category_rule(self, rule_id: str, version: int) -> dict[str, Any]:
+        """Delete a personal rule; entry annotations remain independent."""
+        if not isinstance(version, int) or version < 1:
+            raise BillingError("INVALID_VERSION", "规则版本无效，请刷新后重试。")
+        with self._write_transaction() as session:
+            result = session.execute(
+                delete(BillingCategoryRule).where(
+                    BillingCategoryRule.id == rule_id, BillingCategoryRule.version == version
+                )
+            )
+            if result.rowcount != 1:
+                existing = session.get(BillingCategoryRule, rule_id)
+                if existing is None:
+                    raise BillingError("CATEGORY_RULE_NOT_FOUND", "未找到该个人分类规则。")
+                raise BillingError("VERSION_CONFLICT", "分类规则已在其他位置更新，请刷新后再删除。")
+        return {"id": rule_id, "deleted": True, "version": version}
+
+    def update_entry(self, entry_id: str, version: int, **changes: Any) -> dict[str, Any]:
+        allowed = {"date", "merchant", "amount_minor", "transaction_kind", "category", "tags", "note"}
+        if not changes or set(changes) - allowed:
+            raise BillingError("INVALID_ENTRY_UPDATE", "没有可保存的账单修改。")
+        tags = _billing_tags(changes["tags"]) if "tags" in changes else None
+        note = _billing_note(changes["note"]) if "note" in changes else None
+        kind = _validated_kind(changes["transaction_kind"]) if "transaction_kind" in changes else None
+        category = _billing_category(changes["category"]) if "category" in changes else None
+        normalized_date = _parse_entry_date(changes["date"]).isoformat() if "date" in changes else None
+        merchant = _billing_merchant(changes["merchant"]) if "merchant" in changes else None
+        amount = _signed_billing_amount(changes["amount_minor"]) if "amount_minor" in changes else None
+
+        with self._write_transaction() as session:
+            manual = session.get(BillingManualRecord, entry_id)
+            record: BillingRecord | None = None
+            annotation: BillingAnnotation | None = None
+            bank_transaction: LedgerTransaction | None = None
+            bank_account: Account | None = None
+            if manual is not None:
+                if manual.version != version:
+                    raise BillingError("VERSION_CONFLICT", "账单已在其他位置更新，请刷新后再修改。")
+                if "date" in changes:
+                    manual.date = date.fromisoformat(normalized_date)
+                if merchant is not None:
+                    manual.merchant = merchant
+                if amount is not None:
+                    manual.amount_minor = amount
+                if kind is not None:
+                    manual.transaction_kind = kind
+                if category is not None:
+                    manual.category = category
+                if tags is not None:
+                    manual.tags_json = json.dumps(tags, ensure_ascii=False)
+                if note is not None:
+                    manual.note = note
+                manual.reason = "用户手工记账"
+                manual.version += 1
+            else:
+                record = session.get(BillingRecord, entry_id)
+                if record is None:
+                    row = session.execute(
+                        select(LedgerTransaction, Account)
+                        .join(Account, LedgerTransaction.account_id == Account.id)
+                        .where(LedgerTransaction.id == entry_id, Account.owner_id == DEMO_USER_ID)
+                    ).first()
+                    if row is not None:
+                        bank_transaction, bank_account = row
+                if record is None and bank_transaction is None:
+                    raise BillingError("ENTRY_NOT_FOUND", "未找到可整理的账单记录。")
+
+                if record is not None and record.source not in {"import", "demo"}:
+                    raise BillingError("ENTRY_NOT_EDITABLE", "该账单来源暂不支持修改。")
+                annotation = session.get(BillingAnnotation, entry_id)
+                current_version = annotation.version if annotation else 1
+                if current_version != version:
+                    raise BillingError("VERSION_CONFLICT", "账单已在其他位置更新，请刷新后再修改。")
+                if (
+                    record is not None
+                    and record.source == "demo"
+                    and any(
+                        key in changes for key in ("date", "merchant", "amount_minor", "transaction_kind")
+                    )
+                ):
+                    raise BillingError("ENTRY_FIELD_READ_ONLY", "演示账单只支持整理分类、标签和备注。")
+                if bank_transaction is not None and any(
+                    key in changes for key in ("date", "merchant", "amount_minor", "transaction_kind")
+                ):
+                    raise BillingError("ENTRY_FIELD_READ_ONLY", "银行流水的日期、商户、金额和类型不可修改。")
+                if record is not None and record.source == "import":
+                    current_amount = (
+                        annotation.amount_minor_override
+                        if annotation and annotation.amount_minor_override is not None
+                        else record.amount_minor
+                    )
+                    current_kind = (
+                        annotation.kind_override
+                        if annotation and annotation.kind_override
+                        else record.transaction_kind
+                    )
+                else:
+                    projected = _bank_entry(bank_transaction, bank_account) if bank_transaction else {}
+                    current_amount = projected.get("amount_minor")
+                    current_kind = projected.get("transaction_kind")
+            if manual is not None:
+                current_amount, current_kind = manual.amount_minor, manual.transaction_kind
+            target_amount = amount if amount is not None else current_amount
+            target_kind = kind if kind is not None else current_kind
+            if (target_kind == "expense" and target_amount >= 0) or (
+                target_kind in {"refund", "income"} and target_amount <= 0
+            ):
+                raise BillingError("INVALID_AMOUNT_DIRECTION", "金额方向与收支类型不一致。")
+            if manual is None:
+                if annotation is None:
+                    annotation = BillingAnnotation(entry_id=entry_id, updated_at=datetime.now(UTC))
+                    session.add(annotation)
+                if normalized_date is not None:
+                    annotation.date_override = normalized_date
+                if merchant is not None:
+                    annotation.merchant_override = merchant
+                if amount is not None:
+                    annotation.amount_minor_override = amount
+                if kind is not None:
+                    annotation.kind_override = kind
+                if category is not None:
+                    annotation.category = category
+                if tags is not None:
+                    annotation.tags_json = json.dumps(tags, ensure_ascii=False)
+                if note is not None:
+                    annotation.note = note
+                annotation.version = current_version + 1
+                annotation.updated_at = datetime.now(UTC)
+            session.flush()
+
+        return next((entry for entry in self.entries() if entry["id"] == entry_id), None) or {
+            "id": entry_id,
+            "version": version + 1,
+        }
+
+    def remove_entry(self, entry_id: str, version: int) -> dict[str, Any]:
+        with self._write_transaction() as session:
+            manual = session.get(BillingManualRecord, entry_id)
+            if manual is not None:
+                if manual.version != version:
+                    raise BillingError("VERSION_CONFLICT", "账单已在其他位置更新，请刷新后再移除。")
+                batch_entry = session.scalar(
+                    select(BillingImportBatchEntry).where(BillingImportBatchEntry.entry_id == entry_id)
+                )
+                if batch_entry is not None:
+                    raise BillingError("ENTRY_NOT_EDITABLE", "请通过导入批次撤销这条导入记录。")
+                session.delete(manual)
+                return {"removed": True}
+            record = session.get(BillingRecord, entry_id)
+            if record is None or record.source != "import":
+                raise BillingError("ENTRY_NOT_EDITABLE", "银行和演示流水不能移除。")
+            annotation = session.get(BillingAnnotation, entry_id)
+            if (annotation.version if annotation else 1) != version:
+                raise BillingError("VERSION_CONFLICT", "账单已在其他位置更新，请刷新后再移除。")
+            link = session.scalar(
+                select(BillingImportBatchEntry).where(
+                    BillingImportBatchEntry.entry_id == entry_id,
+                    BillingImportBatchEntry.removed_individually.is_(False),
+                )
+            )
+            if annotation is not None:
+                session.delete(annotation)
+            if link is not None:
+                link.removed_individually = True
+                link.removed_at = datetime.now(UTC)
+            session.delete(record)
+        return {"removed": True, "batch_id": link.batch_id if link is not None else None}
+
+    def create_manual(
+        self,
+        *,
+        client_request_id: str,
+        entry_date: str,
+        merchant: str,
+        amount_minor: int,
+        transaction_kind: str,
+        category: str = "",
+        tags: list[str] | None = None,
+        note: str = "",
+        account_id: str | None = None,
+    ) -> dict[str, Any]:
+        request_id = _billing_request_id(client_request_id)
+        magnitude = _billing_positive_minor(amount_minor)
+        kind = _validated_kind(transaction_kind)
+        signed_amount = -magnitude if kind == "expense" else magnitude
+        day = _parse_entry_date(entry_date)
+        normalized_merchant = _billing_merchant(merchant)
+        normalized_category = (
+            _billing_category(category)
+            if category.strip()
+            else _classify_category(normalized_merchant, kind)[0]
+        )
+        normalized_tags = _billing_tags(tags or [])
+        normalized_note = _billing_note(note)
+        payload = {
+            "entry_date": day.isoformat(),
+            "merchant": normalized_merchant,
+            "amount_minor": signed_amount,
+            "transaction_kind": kind,
+            "category": normalized_category,
+            "tags": normalized_tags,
+            "note": normalized_note,
+            "account_id": account_id,
+        }
+        with self._write_transaction() as session:
+            existing = session.scalar(
+                select(BillingManualRecord).where(BillingManualRecord.client_request_id == request_id)
+            )
+            if existing is not None:
+                existing_payload = {
+                    "entry_date": existing.date.isoformat(),
+                    "merchant": existing.merchant,
+                    "amount_minor": existing.amount_minor,
+                    "transaction_kind": existing.transaction_kind,
+                    "category": existing.category,
+                    "tags": json.loads(existing.tags_json or "[]"),
+                    "note": existing.note,
+                    "account_id": existing.account_id,
+                }
+                if payload != existing_payload:
+                    raise BillingError("REQUEST_ID_REUSED", "该手工记账请求已用于其他记录，请重新提交。")
+                return _manual_entry(existing)
+            row = BillingManualRecord(
+                id=f"manual-{uuid4().hex}",
+                client_request_id=request_id,
+                date=day,
+                merchant=normalized_merchant,
+                amount_minor=signed_amount,
+                currency="CNY",
+                account_id=account_id,
+                transaction_kind=kind,
+                category=normalized_category,
+                reason="用户手工记账",
+                tags_json=json.dumps(normalized_tags, ensure_ascii=False),
+                note=normalized_note,
+                version=1,
+                created_at=datetime.now(UTC),
+            )
+            session.add(row)
+            session.flush()
+            return _manual_entry(row)
+
+    def list_import_batches(self) -> list[dict[str, Any]]:
+        with self._session_factory() as session:
+            batches = session.scalars(
+                select(BillingImportBatch).order_by(BillingImportBatch.created_at.desc())
+            ).all()
+            result = []
+            for batch in batches:
+                item = _batch_dict(batch)
+                removed = (
+                    session.scalar(
+                        select(func.count(BillingImportBatchEntry.id)).where(
+                            BillingImportBatchEntry.batch_id == batch.id,
+                            BillingImportBatchEntry.removed_individually.is_(True),
+                        )
+                    )
+                    or 0
+                )
+                item["removed_individually"] = removed
+                item["remaining_entries"] = 0 if batch.undone_at else max(0, batch.imported - removed)
+                result.append(item)
+            return result
+
+    def undo_import_batch(self, batch_id: str) -> dict[str, Any]:
+        with self._write_transaction() as session:
+            batch = session.get(BillingImportBatch, batch_id)
+            if batch is None:
+                raise BillingError("BATCH_NOT_FOUND", "未找到该账单导入批次。")
+            if batch.undone_at is not None:
+                return {**_batch_dict(batch), "undone_entries": 0, "already_undone": True}
+            links = session.scalars(
+                select(BillingImportBatchEntry).where(BillingImportBatchEntry.batch_id == batch.id)
+            ).all()
+            removed = 0
+            for link in links:
+                record = session.get(BillingRecord, link.entry_id)
+                if not link.removed_individually and record is not None and record.source == "import":
+                    annotation = session.get(BillingAnnotation, record.id)
+                    if annotation is not None:
+                        session.delete(annotation)
+                    session.delete(record)
+                    removed += 1
+                session.delete(link)
+            batch.undone_at = datetime.now(UTC)
+            session.flush()
+            return {**_batch_dict(batch), "undone_entries": removed, "already_undone": False}
+
+    def report(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+        query: str = "",
+        category: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
         requested_start = _parse_filter_date(start, "start") if start is not None else None
         requested_end = _parse_filter_date(end, "end") if end is not None else None
         if requested_start is not None and requested_end is not None and requested_start > requested_end:
             raise BillingError("INVALID_DATE_RANGE", "账单开始日期不能晚于结束日期。")
 
         all_entries = self.entries()
+        needle = query.strip().casefold()
         selected = [
             entry
             for entry in all_entries
             if (requested_start is None or date.fromisoformat(entry["date"]) >= requested_start)
             and (requested_end is None or date.fromisoformat(entry["date"]) <= requested_end)
+            and (category is None or entry["category"] == category)
+            and (source is None or entry["source"] == source)
+            and (
+                not needle
+                or needle
+                in " ".join(
+                    str(entry.get(key) or "")
+                    for key in (
+                        "merchant",
+                        "raw_merchant",
+                        "category",
+                        "note",
+                        "tags",
+                        "account_id",
+                        "reason",
+                    )
+                ).casefold()
+            )
         ]
         dates = [date.fromisoformat(entry["date"]) for entry in selected]
         report_start = requested_start or (min(dates) if dates else _shanghai_today())
@@ -398,11 +892,12 @@ class BillingService:
         coverage_start = min(dates).isoformat() if dates else None
         coverage_end = max(dates).isoformat() if dates else None
         source_notice = (
-            "统计包含只读银行流水及独立导入/演示账本。消费按扣款绝对值汇总；退款单独列示并从净消费扣除；"
+            "统计包含只读银行流水、独立导入/演示账本和个人手工记账；手工记账不会改变银行余额。"
+            "消费按扣款绝对值汇总；退款单独列示并从净消费扣除；"
             "转账与期初余额不计入收入或消费。覆盖区间只反映当前已见流水，不外推未覆盖月份。"
         )
         if not selected:
-            source_notice += " 当前筛选区间没有流水。"
+            source_notice += " 当前筛选条件没有流水。"
 
         return {
             "start": report_start.isoformat(),
@@ -420,8 +915,11 @@ class BillingService:
             "source_notice": source_notice,
         }
 
-    def import_csv(self, content: str, filename: str = "账单.csv") -> dict[str, Any]:
-        del filename  # The filename is display metadata, never a dedupe key.
+    def import_csv(
+        self, content: str, filename: str = "账单.csv", client_request_id: str | None = None
+    ) -> dict[str, Any]:
+        request_id = _billing_request_id(client_request_id) if client_request_id else None
+        filename = _billing_filename(filename)
         errors: list[dict[str, Any]] = []
         if not isinstance(content, str):
             return _import_result(0, 0, [{"row": 1, "message": "CSV 内容必须是文本。"}])
@@ -457,6 +955,24 @@ class BillingService:
         imported = 0
         duplicates = 0
         with self._write_transaction() as session:
+            batch = None
+            if request_id:
+                batch = session.scalar(
+                    select(BillingImportBatch).where(BillingImportBatch.client_request_id == request_id)
+                )
+                if batch is not None:
+                    return _import_batch_result(batch, already_processed=True)
+            batch = BillingImportBatch(
+                id=f"batch-{uuid4().hex}",
+                client_request_id=request_id,
+                filename=filename,
+                imported=0,
+                duplicates=0,
+                errors_json="[]",
+                created_at=datetime.now(UTC),
+            )
+            session.add(batch)
+            session.flush()
             for row in reader:
                 row_number = reader.line_num
                 if row is None or all(value in (None, "") for value in row.values()):
@@ -501,7 +1017,14 @@ class BillingService:
 
                 try:
                     with session.begin_nested():
-                        session.add(BillingRecord(**_record_values(fixture, source="import")))
+                        record = BillingRecord(**_record_values(fixture, source="import"))
+                        session.add(record)
+                        session.flush()
+                        session.add(
+                            BillingImportBatchEntry(
+                                id=f"batch-entry-{uuid4().hex}", batch_id=batch.id, entry_id=record.id
+                            )
+                        )
                         session.flush()
                     imported += 1
                 except IntegrityError:
@@ -526,7 +1049,10 @@ class BillingService:
                     else:
                         errors.append({"row": row_number, "message": "账单标识发生冲突，未覆盖已有记录。"})
 
-        return _import_result(imported, duplicates, errors)
+            batch.imported = imported
+            batch.duplicates = duplicates
+            batch.errors_json = json.dumps(errors, ensure_ascii=False)
+        return _import_result(imported, duplicates, errors, batch_id=batch.id)
 
     def _bank_entries(self, session: Session) -> list[dict[str, Any]]:
         table_names = set(inspect(self.engine).get_table_names())
@@ -584,11 +1110,174 @@ def sample_csv() -> str:
     return _SAMPLE_CSV.read_text(encoding="utf-8")
 
 
-def _import_result(imported: int, duplicates: int, errors: list[dict[str, Any]]) -> dict[str, Any]:
+def _import_result(
+    imported: int,
+    duplicates: int,
+    errors: list[dict[str, Any]],
+    *,
+    batch_id: str | None = None,
+) -> dict[str, Any]:
     message = f"已导入 {imported} 条，重复 {duplicates} 条。"
     if errors:
         message += f" {len(errors)} 行未导入，请按行查看原因。"
-    return {"imported": imported, "duplicates": duplicates, "errors": errors, "message": message}
+    return {
+        "imported": imported,
+        "duplicates": duplicates,
+        "errors": errors,
+        "message": message,
+        "batch_id": batch_id,
+    }
+
+
+def _batch_dict(batch: BillingImportBatch) -> dict[str, Any]:
+    return {
+        "id": batch.id,
+        "filename": batch.filename,
+        "imported": batch.imported,
+        "duplicates": batch.duplicates,
+        "errors": json.loads(batch.errors_json or "[]"),
+        "undone": batch.undone_at is not None,
+        "created_at": _billing_iso_utc(batch.created_at),
+        "undone_at": _billing_iso_utc(batch.undone_at) if batch.undone_at else None,
+    }
+
+
+def _billing_iso_utc(value: datetime) -> str:
+    return (value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)).isoformat()
+
+
+def _import_batch_result(batch: BillingImportBatch, *, already_processed: bool) -> dict[str, Any]:
+    errors = json.loads(batch.errors_json or "[]")
+    result = _import_result(batch.imported, batch.duplicates, errors, batch_id=batch.id)
+    result["already_processed"] = already_processed
+    return result
+
+
+def _billing_request_id(value: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 160:
+        raise BillingError("INVALID_REQUEST_ID", "请求标识无效，请重新操作。")
+    return value.strip()
+
+
+def _billing_filename(value: str) -> str:
+    filename = " ".join(str(value or "账单.csv").replace("\\", "/").split("/")[-1].split())
+    if not filename or len(filename) > 200:
+        raise BillingError("INVALID_FILENAME", "文件名无效或过长。")
+    return filename
+
+
+def _billing_merchant(value: str) -> str:
+    merchant = " ".join(value.strip().split()) if isinstance(value, str) else ""
+    if not merchant or len(merchant) > 160:
+        raise BillingError("INVALID_MERCHANT", "商户名称不能为空，且不得超过160字。")
+    return merchant
+
+
+def _billing_category(value: str) -> str:
+    category = " ".join(value.strip().split()) if isinstance(value, str) else ""
+    if not category or len(category) > 80:
+        raise BillingError("INVALID_CATEGORY", "分类名称不能为空，且不得超过80字。")
+    return category
+
+
+def _billing_note(value: str) -> str:
+    if not isinstance(value, str) or len(value) > 500:
+        raise BillingError("INVALID_NOTE", "备注不得超过500字。")
+    return value.strip()
+
+
+def _category_merchant_key(value: str) -> str:
+    normalized, _ = _normalize_merchant(value)
+    return " ".join(normalized.casefold().split())
+
+
+def _category_rule_note(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(value.strip().split()) if isinstance(value, str) else ""
+    if len(normalized) > 500:
+        raise BillingError("INVALID_CATEGORY_RULE", "备注匹配条件不得超过500字。")
+    return normalized or None
+
+
+def _category_rule_note_key(value: str | None) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+def _category_rule_payload(
+    merchant: str,
+    category: str,
+    transaction_kind: str | None,
+    note_contains: str | None,
+    effective_from: date,
+) -> dict[str, Any]:
+    return {
+        "merchant": merchant,
+        "category": category,
+        "transaction_kind": transaction_kind,
+        "note_contains": note_contains,
+        "effective_from": effective_from.isoformat(),
+    }
+
+
+def _category_rule_dict(rule: BillingCategoryRule) -> dict[str, Any]:
+    return {
+        "id": rule.id,
+        "merchant": rule.merchant,
+        "category": rule.category,
+        "transaction_kind": rule.transaction_kind,
+        "note_contains": rule.note_contains,
+        "effective_from": rule.effective_from.isoformat(),
+        "version": rule.version,
+        "created_at": _billing_iso_utc(rule.created_at),
+        "updated_at": _billing_iso_utc(rule.updated_at),
+    }
+
+
+def _idempotent_category_rule(rule: BillingCategoryRule, payload: dict[str, Any]) -> dict[str, Any]:
+    existing_payload = json.loads(rule.request_payload_json)
+    if existing_payload != payload:
+        raise BillingError("REQUEST_ID_REUSED", "该规则请求标识已用于其他内容，请重新提交。")
+    return _category_rule_dict(rule)
+
+
+def _billing_tags(values: list[str]) -> list[str]:
+    if not isinstance(values, list) or len(values) > 10:
+        raise BillingError("INVALID_TAGS", "标签最多10个。")
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        tag = " ".join(value.strip().split()) if isinstance(value, str) else ""
+        if not tag or len(tag) > 40:
+            raise BillingError("INVALID_TAGS", "标签不能为空，且每个不得超过40字。")
+        folded = tag.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            result.append(tag)
+    return result
+
+
+def _signed_billing_amount(value: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not value
+        or abs(value) > MAX_SAFE_JSON_INTEGER
+    ):
+        raise BillingError("INVALID_AMOUNT", "金额须为非零整数分。")
+    return value
+
+
+def _billing_positive_minor(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value > MAX_SAFE_JSON_INTEGER:
+        raise BillingError("INVALID_AMOUNT", "金额须为大于零的整数分。")
+    return value
+
+
+def _validated_kind(value: str) -> str:
+    if value not in {"expense", "refund", "income", "transfer", "opening"}:
+        raise BillingError("INVALID_KIND", "交易类型仅支持消费、退款、收入、转账或期初余额。")
+    return value
 
 
 def _parse_csv_row(
@@ -844,10 +1533,17 @@ def _bank_entry(transaction: LedgerTransaction, account: Account) -> dict[str, A
         "source": "bank",
         "confidence": confidence,
         "reason": reason,
+        "version": 1,
+        "tags": [],
+        "note": "",
+        "editable": True,
+        "_rule_created_at": transaction.created_at,
+        "_explicit_category": False,
     }
 
 
 def _record_entry(record: BillingRecord) -> dict[str, Any]:
+    source_category_is_explicit = "采用 CSV 提供的类别字段" in record.reason
     return {
         "id": record.id,
         "date": record.date,
@@ -861,7 +1557,108 @@ def _record_entry(record: BillingRecord) -> dict[str, Any]:
         "source": record.source,
         "confidence": record.confidence,
         "reason": record.reason,
+        "version": 1,
+        "tags": [],
+        "note": "",
+        "editable": True,
+        "_rule_created_at": record.created_at,
+        "_explicit_category": source_category_is_explicit,
+        "_explicit_category_source": "source_input" if source_category_is_explicit else None,
     }
+
+
+def _manual_entry(record: BillingManualRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "date": record.date.isoformat(),
+        "merchant": record.merchant,
+        "raw_merchant": record.merchant,
+        "amount_minor": record.amount_minor,
+        "currency": record.currency,
+        "account_id": record.account_id,
+        "category": record.category,
+        "transaction_kind": record.transaction_kind,
+        "source": "manual",
+        "confidence": 1.0,
+        "reason": record.reason,
+        "version": record.version,
+        "tags": json.loads(record.tags_json or "[]"),
+        "note": record.note,
+        "editable": True,
+        "_rule_created_at": record.created_at,
+        "_explicit_category": True,
+        "_explicit_category_source": "manual_entry",
+    }
+
+
+def _apply_annotation(entry: dict[str, Any], annotation: BillingAnnotation | None) -> dict[str, Any]:
+    if annotation is None:
+        return entry
+    for output, attribute in (
+        ("date", "date_override"),
+        ("merchant", "merchant_override"),
+        ("amount_minor", "amount_minor_override"),
+        ("transaction_kind", "kind_override"),
+    ):
+        value = getattr(annotation, attribute)
+        if value is not None:
+            entry[output] = value
+    if annotation.category is not None:
+        entry["category"] = annotation.category
+        entry["reason"] = "用户手动修改分类；" + entry["reason"]
+        entry["_explicit_category"] = True
+        entry["_explicit_category_source"] = "single_entry"
+        entry["category_source"] = "single_entry"
+    entry["tags"] = json.loads(annotation.tags_json or "[]")
+    entry["note"] = annotation.note
+    entry["version"] = annotation.version
+    return entry
+
+
+def _apply_category_rule(
+    entry: dict[str, Any], rules: list[BillingCategoryRule]
+) -> dict[str, Any]:
+    created_at = entry.pop("_rule_created_at", None)
+    explicit = entry.pop("_explicit_category", False)
+    explicit_source = entry.pop("_explicit_category_source", None)
+    if explicit or entry.get("source") == "demo" or not isinstance(created_at, datetime):
+        if explicit and entry.get("source") != "manual" and explicit_source:
+            entry.setdefault("category_source", explicit_source)
+        return entry
+    created_at_utc = created_at.replace(tzinfo=UTC) if created_at.tzinfo is None else created_at.astimezone(UTC)
+    transaction_day = date.fromisoformat(entry["date"])
+    merchant_key = _category_merchant_key(entry["merchant"])
+    note_key = _category_rule_note_key(entry.get("note"))
+    kind = entry.get("transaction_kind")
+    matches = [
+        rule
+        for rule in rules
+        if merchant_key == rule.merchant_key
+        and transaction_day >= rule.effective_from
+        and created_at_utc
+        >= (rule.created_at.replace(tzinfo=UTC) if rule.created_at.tzinfo is None else rule.created_at.astimezone(UTC))
+        and (not rule.transaction_kind or kind == rule.transaction_kind)
+        and (not rule.note_condition_key or rule.note_condition_key in note_key)
+    ]
+    if not matches:
+        return entry
+    rule = max(
+        matches,
+        key=lambda item: (
+            bool(item.note_condition_key),
+            bool(item.transaction_kind),
+            len(item.note_condition_key),
+            item.effective_from,
+            item.created_at.replace(tzinfo=UTC)
+            if item.created_at.tzinfo is None
+            else item.created_at.astimezone(UTC),
+        ),
+    )
+    entry["category"] = rule.category
+    entry["category_source"] = "personal_rule"
+    entry["category_rule_id"] = rule.id
+    entry["reason"] = f"命中个人分类规则；{entry['reason']}"
+    return entry
 
 
 def _record_values(fixture: Mapping[str, Any], source: str) -> dict[str, Any]:

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { decideAction, money, timestamp } from "../api";
-import type { Account, Action, DecisionResponse } from "../types";
+import type { Account, Action, DecisionResponse, WorkflowAction } from "../types";
 import { availableMoney } from "../task-utils";
+import { WorkflowConfirmation } from "./WorkflowConfirmation";
 import { TaskConfirmation } from "./TaskConfirmation";
 import { cardStatus } from "./CardsPage";
 interface Props {
@@ -10,6 +11,9 @@ interface Props {
   accounts: Account[];
   conversationId: string;
   chatBusy: boolean;
+  onDirtyChange: (value:boolean) => void;
+  onEditingChange: (value:boolean) => void;
+  onRevised: (action:WorkflowAction) => void;
   onClose: () => void;
   onBusy: (busy: boolean) => void;
   onDone: (result: DecisionResponse) => void;
@@ -19,10 +23,14 @@ export function ActionDrawer({
   accounts,
   conversationId,
   chatBusy,
+  onDirtyChange,
+  onEditingChange,
+  onRevised,
   onClose,
   onBusy,
   onDone,
 }: Props) {
+  const [editing,setEditing]=useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [now, setNow] = useState(Date.now());
@@ -38,7 +46,7 @@ export function ActionDrawer({
   }, []);
   const expired = Date.parse(action.expires_at) <= now;
   async function decide(decision: "approve" | "decline") {
-    if (lock.current || chatBusy || expired) return;
+    if (lock.current || chatBusy || expired || editing) return;
     lock.current = true;
     setBusy(true);
     onBusy(true);
@@ -66,7 +74,7 @@ export function ActionDrawer({
       ? accounts.find((account) => account.id === action.source_account_id)
       : null;
   return (
-    <aside className="action-drawer" aria-label={action.title}>
+    <aside className={`action-drawer ${action.kind === "workflow" ? "workflow-drawer" : ""}`} aria-label={action.title}>
       <div className="drawer-heading">
         <div>
           <h2>{action.kind==="wealth"?(action.action==="purchase"?"申购确认":"赎回确认"):action.title}</h2>
@@ -118,7 +126,7 @@ export function ActionDrawer({
             <p>有效期至：{timestamp(action.expires_at)}</p>
           </details>
         </>
-      ) : action.kind === "task" ? <TaskConfirmation action={action} accounts={accounts}/> : action.kind === "card" ? (
+      ) : action.kind === "workflow" ? <WorkflowConfirmation action={action} accounts={accounts} conversationId={conversationId} disabled={busy||chatBusy||expired} onDirty={onDirtyChange} onEditing={value=>{setEditing(value);onEditingChange(value);}} onBusy={onBusy} onRevised={onRevised}/> : action.kind === "task" ? <TaskConfirmation action={action} accounts={accounts}/> : action.kind === "card" ? (
         <>
           <div className="subscription-effect"><h3>{action.card_name ?? (action.card_kind==="credit"?"信用卡申请":"借记卡申请")}</h3><p>{action.description}</p></div>
           <dl className="transfer-fields">
@@ -155,7 +163,7 @@ export function ActionDrawer({
           <p className="muted small">有效期至 {timestamp(action.expires_at)}</p>
         </>
       )}
-      {expired ? (
+      {editing ? null : expired ? (
         <p className="inline-error">请重新发起预览，获取新的确认单。</p>
       ) : (
         <div className="transfer-actions">
@@ -173,6 +181,8 @@ export function ActionDrawer({
           >
             {busy
               ? "正在办理…"
+              : action.kind === "workflow"
+                ? action.action === "arrange" ? "确认安排" : "确认取消安排"
               : action.kind === "task"
                 ? ({create_aa:"确认创建AA",cancel_aa:"确认取消未付",schedule_transfer:"确认安排",cancel_schedule:"确认撤销"}[action.action])
               : action.kind === "transfer"

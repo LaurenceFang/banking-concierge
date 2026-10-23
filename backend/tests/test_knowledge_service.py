@@ -34,7 +34,7 @@ def test_each_of_six_scenarios_retrieves_a_useful_faq(
     assert expected_heading in results[0]["excerpt"]
     assert "\n" in results[0]["excerpt"]
     assert results[0]["excerpt"].split("\n", 1)[1].strip()
-    assert results[0]["version"] == "0.3"
+    assert results[0]["version"] == "0.4"
     assert results[0]["score"] > 0
 
 

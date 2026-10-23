@@ -58,7 +58,50 @@ _SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
     ("异常交易", "可疑交易", "异常消费"),
     ("商户", "商家"),
     ("取消会员", "会员续费", "取消订阅", "取消自动续费"),
+    ("订阅候选", "候选订阅", "误判", "错误识别", "不是订阅"),
 )
+
+# A small router for follow-up retrieval, not an intent classifier. Explicit
+# domain words prevent a question about a new topic from inheriting stale
+# history. Generic terms such as "费用" are intentionally absent because they
+# may apply to transfers, subscriptions, wealth products, or billing.
+_CONTEXT_DOMAINS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "wealth",
+        ("理财", "申购", "赎回", "持仓", "份额", "风险测评", "锁定期", "结算"),
+    ),
+    (
+        "cards",
+        ("信用卡", "借记卡", "银行卡", "卡片", "卡号", "挂失", "冻结", "解锁", "调额", "额度"),
+    ),
+    (
+        "subscriptions",
+        ("订阅", "会员", "续费", "自动续费", "代扣", "扣款授权", "云服务"),
+    ),
+    (
+        "billing",
+        ("账单", "流水", "csv", "导入", "分类", "记账", "报表", "月报", "收支"),
+    ),
+    (
+        "tasks",
+        ("aa", "均摊", "分摊", "定时转账", "定时", "付款请求", "待收款"),
+    ),
+    (
+        "workflow",
+        ("生活安排", "生日", "鲜花", "花束", "蛋糕", "服务目录", "安排商户"),
+    ),
+    (
+        "transfer",
+        ("转账", "转给", "转出", "收款人", "收付款", "收款账户", "收款", "转款"),
+    ),
+)
+_FOLLOWUP_RE = re.compile(
+    r"(?:^|\s)(?:那|那么|这个|那笔|这笔|它|刚才|上面|上述|接着|继续|之后)|"
+    r"(?:呢|吗|么|多少|多久|什么时候|怎么|如何|能不能|可不可以|是否|具体|会不会)[？?！!。…]*$"
+)
+_TOPIC_SWITCH_RE = re.compile(r"(?:换个话题|另一个问题|另外一件事|现在问另一个|说个新的|不说这个了)")
+_CONTEXT_HISTORY_WINDOW = 6
+_MAX_CONTEXT_CHARS = 120
 
 
 @dataclass(frozen=True)
@@ -92,6 +135,63 @@ def _as_text(value: Any, default: str = "") -> str:
     if value is None:
         return default
     return str(value).strip()
+
+
+def _context_topics(text: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    topics: set[str] = set()
+    for topic, terms in _CONTEXT_DOMAINS:
+        for term in terms:
+            if term == "aa":
+                if re.search(r"(?<![a-z0-9])aa(?![a-z0-9])", normalized):
+                    topics.add(topic)
+                    break
+            elif term in normalized:
+                topics.add(topic)
+                break
+    return topics
+
+
+def _context_for_followup(query: str, history: list[str] | None) -> str | None:
+    """Select one recent user utterance for a short, plausibly referential query."""
+    normalized_query = unicodedata.normalize("NFKC", query).strip()
+    if (
+        not normalized_query
+        or len(normalized_query) > 48
+        or _TOPIC_SWITCH_RE.search(normalized_query)
+        or not _FOLLOWUP_RE.search(normalized_query)
+    ):
+        return None
+
+    recent_messages = [
+        unicodedata.normalize("NFKC", item).strip()
+        for item in (history or [])[-_CONTEXT_HISTORY_WINDOW:]
+        if isinstance(item, str) and item.strip()
+    ]
+    if not recent_messages:
+        return None
+
+    current_topics = _context_topics(normalized_query)
+    previous = next(
+        (
+            message
+            for message in reversed(recent_messages)
+            if _context_topics(message)
+        ),
+        None,
+    )
+    if previous is None:
+        return None
+
+    previous_topics = _context_topics(previous)
+    # Every explicit domain in the current question must already be present in
+    # the selected context. A shared word such as "转账" must not pull a mixed
+    # question about a newly named card topic back into an older transfer turn.
+    if current_topics and not current_topics.issubset(previous_topics):
+        return None
+
+    context = re.sub(r"\s+", " ", previous).strip()
+    return context[-_MAX_CONTEXT_CHARS:] or None
 
 
 def _parse_date(value: Any, field_name: str) -> date | None:
@@ -464,3 +564,24 @@ class KnowledgeService:
             }
             for score, _order, chunk in ranked[:limit]
         ]
+
+    def search_contextual(
+        self,
+        query: str,
+        history: list[str] | None = None,
+        limit: int = 4,
+    ) -> list[dict[str, str | float]]:
+        """Retrieve with bounded user-history expansion for short follow-ups.
+
+        ``history`` contains recent user messages and excludes the current query.
+        The BM25 ``search`` method remains the baseline and is used unchanged
+        whenever the query is self-contained, has an explicit topic switch, or
+        names a different domain from the most recent relevant user message.
+        The return rows intentionally keep the exact ``search`` shape.
+        """
+        if limit <= 0 or not isinstance(query, str) or not query.strip():
+            return []
+        context = _context_for_followup(query, history)
+        if context is None:
+            return self.search(query, limit=limit)
+        return self.search(f"{query.strip()} {context}", limit=limit)

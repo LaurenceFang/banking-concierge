@@ -1,0 +1,30 @@
+.arrangements-page { font-size:14.5px; color:#30362e; }
+.arrangements-page :is(h2,h3) { font-size:16px; }
+.arrangements-heading,.arrangement-title { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:24px; }
+.arrangements-heading .text-button { display:flex; gap:6px; align-items:center; }
+.arrangement-title { justify-content:flex-start; margin:12px 0; flex-wrap:wrap; }
+.arrangement-form,.arrangement-detail { max-width:900px; }
+.arrangement-form fieldset { border:0; margin:0; padding:0; display:grid; gap:18px; min-width:0; }
+.arrangement-form fieldset>label { display:grid; grid-template-columns:145px minmax(0,1fr); gap:16px; align-items:center; max-width:650px; }
+.arrangement-form input:not([type=checkbox]),.arrangement-form select,.arrangement-filters select { min-width:0; width:100%; font:inherit; color:inherit; padding:10px 12px; border:1px solid var(--line); border-radius:4px; background:transparent; }
+.arrangement-form input[type=checkbox] { accent-color:var(--accent); }
+.arrangement-product { display:grid; grid-template-columns:minmax(0,1fr) auto 90px auto; gap:18px; align-items:center; padding:18px 0; border-bottom:1px solid var(--line); }
+.arrangement-product-choice { display:flex; gap:12px; align-items:center; }
+.arrangement-product small,.arrangement-step small,.arrangement-list-row small,.workflow-confirm-items small { display:block; color:var(--muted); margin-top:6px; font-size:12px; }
+.arrangement-quantity { display:grid; gap:5px; font-size:12px; color:var(--muted); }
+.arrangement-quote { margin:22px 0; padding:18px 0; border-bottom:1px solid var(--line); }
+.arrangement-quote>div { display:flex; justify-content:space-between; margin-bottom:9px; }.arrangement-quote strong { font-size:20px; }
+.arrangement-metrics { display:flex; flex-wrap:wrap; gap:24px 30px; border-block:1px solid var(--line); padding:22px 0; margin:24px 0; }
+.arrangement-metrics>div { display:grid; gap:8px; }.arrangement-metrics span { color:var(--muted); font-size:12px; }.arrangement-metrics strong { font-size:16px; }
+.arrangement-status { display:inline-block; padding:4px 8px; background:#e8eee3; color:#506348; border-radius:3px; font-size:12px; }
+.arrangement-status:is(.state-refund_pending,.state-failed,.state-partial) { color:#975851; background:#f2e7e3; }
+.arrangement-status:is(.state-scheduled,.state-pending,.state-unknown) { color:#887046; background:#f0ecdf; }
+.arrangement-step { padding:18px 0; border-bottom:1px solid var(--line); }.arrangement-step-title { display:grid; grid-template-columns:minmax(0,1fr) auto auto; align-items:center; gap:24px; margin-bottom:12px; }
+.arrangement-step details { margin-top:10px; font-size:12px; color:var(--muted); }.arrangement-step dl>div { display:grid; grid-template-columns:85px minmax(0,1fr); gap:12px; margin:8px 0; }.arrangement-step dd { margin:0; overflow-wrap:anywhere; }
+.arrangement-outcome { margin:24px 0 10px; }.arrangement-actions { display:flex; flex-wrap:wrap; gap:16px; margin-top:24px; }
+.arrangement-filters { margin:24px 0; }.arrangement-filters label { display:flex; align-items:center; gap:12px; }.arrangement-filters select { width:auto; max-width:100%; }
+.arrangement-list-row { width:100%; display:grid; grid-template-columns:minmax(0,1fr) auto auto; align-items:center; gap:22px; border:0; border-bottom:1px solid var(--line); background:transparent; padding:22px 0; text-align:left; }
+.arrangement-list-row:hover { background:#edf0e8; }.arrangement-notice { margin:12px 0 24px; border-left:2px solid #7a8c72; padding:8px 14px; }
+.workflow-confirm-items { margin:22px 0; }.workflow-confirm-items>div { display:flex; justify-content:space-between; gap:16px; border-bottom:1px solid var(--line); padding:13px 0; font-size:13px; }
+.workflow-confirmation dd small { display:block; font-size:12px; color:var(--muted); margin-top:5px; }.workflow-compensation { margin:14px 0; font-size:14px; }
+@media(max-width:850px) { .arrangement-product { grid-template-columns:minmax(0,1fr) auto; }.arrangement-form fieldset>label { grid-template-columns:1fr; gap:8px; }.arrangement-list-row { grid-template-columns:1fr auto; }.arrangement-list-row>.arrangement-status { grid-column:1/-1; justify-self:start; }.arrangement-step-title { grid-template-columns:1fr auto; gap:12px; }.arrangement-step-title>.arrangement-status { grid-column:1/-1; justify-self:start; } }

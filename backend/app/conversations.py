@@ -28,6 +28,7 @@ SCOPES = frozenset(
         "wealth/orders",
         "wealth/risk",
         "life/subscriptions",
+        "life/arrangements",
     }
 )
 
@@ -190,6 +191,8 @@ class ConversationStore:
             return "life/subscriptions"
         if kind == "task":
             return "bills/payments"
+        if kind == "workflow":
+            return "life/arrangements"
         if kind == "wealth":
             return "wealth/orders"
         return None

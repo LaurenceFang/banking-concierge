@@ -232,6 +232,10 @@ def test_seed_demo_is_rolling_idempotent_and_contains_required_fixtures(billing:
             "source",
             "confidence",
             "reason",
+            "tags",
+            "note",
+            "version",
+            "editable",
         }
         for entry in second
     )

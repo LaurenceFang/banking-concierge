@@ -1,11 +1,12 @@
 import type {
+  WorkflowList, WorkflowAction, WorkflowInput, WorkflowTask,
   TaskList, TaskRecipient, TaskAction, TaskPreviewInput,
   ChatResponse,
   DecisionResponse,
   Overview,
   Conversation,
   ConversationDetail,
-  BillingReport,
+  BillingReport, BillingEntry, ImportBatch, PersonalRecord,
   ImportResult,
   SubscriptionAction,
   SubscriptionList,
@@ -21,6 +22,19 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+function validationMessage(detail: unknown): string | undefined {
+  if (!Array.isArray(detail)) return undefined;
+  const labels: Record<string,string> = {name:"名称",note:"备注",bank_name:"模拟银行名称",account_last4:"账户尾号",merchant_name:"模拟商户",price_minor:"单价",unit:"单位",description:"简短说明",cancel_supported:"取消规则",version:"资料版本",client_request_id:"保存请求标识"};
+  const errors = detail.flatMap(issue => {
+    if (!issue || typeof issue !== "object") return [];
+    const location = Array.isArray(issue.loc) ? issue.loc.filter((part:unknown)=>part!=="body"&&part!=="query") : [];
+    const field = String(location.at(-1)??"参数");
+    const message = issue.type==="extra_forbidden" ? "包含不支持的字段" : issue.type==="missing" ? "请补充此项" : typeof issue.msg==="string" ? issue.msg : "请核对填写内容";
+    return [`${labels[field]??field}：${message}`];
+  });
+  return errors.length ? `参数有误，${errors.join("；")}` : "参数有误，请核对填写内容。";
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -43,7 +57,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         ? data.detail.message
         : typeof data?.detail === "string"
           ? data.detail
-          : "服务暂时不可用，请稍后重试。",
+          : validationMessage(data?.detail) ?? "服务暂时不可用，请稍后重试。",
       data?.detail?.code,
     );
   }
@@ -206,14 +220,14 @@ export const getConversation = (id: string) =>
   request<ConversationDetail>(`/conversations/${encodeURIComponent(id)}`);
 export const markRead = (id: string) =>
   request(`/conversations/${encodeURIComponent(id)}/read`, { method: "POST" });
-export const getBillingReport = (start: string, end: string) =>
+export const getBillingReport = (start: string, end: string, filters: {query?:string;category?:string;source?:string} = {}) =>
   request<BillingReport>(
-    `/billing/report?${new URLSearchParams({ ...(start ? { start } : {}), ...(end ? { end } : {}) })}`,
+    `/billing/report?${new URLSearchParams({ ...(start ? { start } : {}), ...(end ? { end } : {}), ...Object.fromEntries(Object.entries(filters).filter(([,v])=>v)) })}`,
   );
-export const importBilling = (filename: string, content: string) =>
+export const importBilling = (filename: string, content: string, client_request_id?:string) =>
   request<ImportResult>("/billing/import", {
     method: "POST",
-    body: JSON.stringify({ filename, content }),
+    body: JSON.stringify({ filename, content, client_request_id }),
   });
 export const getSubscriptions = () =>
   request<SubscriptionList>("/subscriptions");
@@ -237,7 +251,7 @@ export const decideAction = (
   action.kind === "transfer"
     ? decidePlan(action.id, decision, conversationId)
     : request<DecisionResponse>(
-        `/${action.kind === "task" ? "task" : action.kind === "card" ? "card" : action.kind === "wealth" ? "wealth" : "subscription"}-plans/${encodeURIComponent(action.id)}/decision`,
+        `/${action.kind === "workflow" ? "workflow" : action.kind === "task" ? "task" : action.kind === "card" ? "card" : action.kind === "wealth" ? "wealth" : "subscription"}-plans/${encodeURIComponent(action.id)}/decision`,
         {
           method: "POST",
           body: JSON.stringify({ decision, conversation_id: conversationId }),
@@ -282,3 +296,29 @@ export const previewTask = (input: TaskPreviewInput) => request<TaskAction>("/ta
 export const simulateTaskPayment = (id: string, participantId: string) => request<DecisionResponse>(`/tasks/${encodeURIComponent(id)}/demo-payment`, {method:"POST",body:JSON.stringify({participant_id:participantId})});
 export const getTaskClock = () => request<{now:string;timezone:string}>("/tasks/clock");
 export const advanceTaskClock = (minutes: number) => request<{now:string;timezone:string}>("/tasks/demo/advance", {method:"POST",body:JSON.stringify({minutes})});
+
+export const getWorkflows = () => request<WorkflowList>("/workflows");
+export const previewWorkflow = (input:WorkflowInput) => request<WorkflowAction>("/workflows/preview",{method:"POST",body:JSON.stringify(input)});
+export const recoverWorkflow = (id:string) => request<WorkflowTask>(`/workflows/${encodeURIComponent(id)}/recover`,{method:"POST"});
+
+export const getContacts=(query="")=>request<{contacts:import("./types").Contact[]}>(`/contacts?query=${encodeURIComponent(query)}`);
+export const getManagedServices=(query="")=>request<{services:import("./types").ManagedService[]}>(`/workflow-services?query=${encodeURIComponent(query)}`);
+function directoryBody(id:string|undefined,body:Record<string,unknown>){
+ const payload={...body};
+ if(id)delete payload.client_request_id;else delete payload.version;
+ return JSON.stringify(payload);
+}
+export const saveContact=(id:string|undefined,body:Record<string,unknown>)=>request<import("./types").Contact>(id?`/contacts/${encodeURIComponent(id)}`:"/contacts",{method:id?"PATCH":"POST",body:directoryBody(id,body)});
+export const saveManagedService=(id:string|undefined,body:Record<string,unknown>)=>request<import("./types").ManagedService>(id?`/workflow-services/${encodeURIComponent(id)}`:"/workflow-services",{method:id?"PATCH":"POST",body:directoryBody(id,body)});
+export const removeDirectoryItem=(kind:"contacts"|"services",id:string,version:number)=>request<{removed:boolean;pending_tasks:number}>(`/${kind==="contacts"?"contacts":"workflow-services"}/${encodeURIComponent(id)}?version=${version}`,{method:"DELETE"});
+
+export const saveBillingEntry=(id:string|undefined, payload:Record<string,unknown>)=>request<BillingEntry>(id?`/billing/entries/${encodeURIComponent(id)}`:"/billing/manual",{method:id?"PATCH":"POST",body:JSON.stringify(payload)});
+export const removeBillingEntry=(id:string,version:number)=>request(`/billing/entries/${encodeURIComponent(id)}?version=${version}`,{method:"DELETE"});
+export const getImportBatches=()=>request<{batches:ImportBatch[]}>("/billing/import-batches");
+export const undoImportBatch=(id:string)=>request(`/billing/import-batches/${encodeURIComponent(id)}/undo`,{method:"POST"});
+export const savePersonalRecord=(id:string|undefined,payload:Record<string,unknown>)=>request<PersonalRecord>(id?`/subscription-records/${encodeURIComponent(id)}`:"/subscription-records",{method:id?"PATCH":"POST",body:JSON.stringify(payload)});
+export const removePersonalRecord=(id:string,version:number)=>request(`/subscription-records/${encodeURIComponent(id)}?version=${version}`,{method:"DELETE"});
+export const setCandidateFeedback=(id:string,feedback:string,version:number)=>request(`/subscription-candidates/${encodeURIComponent(id)}/feedback`,{method:"PUT",body:JSON.stringify({feedback,version})});
+
+export type WorkflowRevisionInput = {conversation_id:string; title?:string;recipient_label?:string;budget_minor?:number;account_id?:string;execute_at?:string|null;items?:{product_id:string;quantity:number}[]};
+export const reviseWorkflow = (id:string,input:WorkflowRevisionInput) => request<WorkflowAction>(`/workflow-plans/${encodeURIComponent(id)}/revise`,{method:"POST",body:JSON.stringify(input)});

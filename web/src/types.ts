@@ -51,6 +51,7 @@ export interface DecisionResponse {
   status: "completed" | "declined";
   message: string;
   operation_id?: string;
+  steps?: unknown[];
   task_id?: string;
   task_status?: string;
   state_version?: number;
@@ -80,7 +81,7 @@ export interface Conversation {
 }
 export type Action =
   | (Plan & { kind: "transfer"; title: string; conversation_id?: string })
-  | SubscriptionAction | CardAction | WealthAction | TaskAction;
+  | SubscriptionAction | CardAction | WealthAction | TaskAction | WorkflowAction;
 export interface SubscriptionAction {
   id: string;
   kind: "subscription";
@@ -99,6 +100,7 @@ export interface ConversationDetail {
   pending_action: Action | null;
 }
 export interface BillingEntry {
+  version: number; tags: string[]; note: string; editable: boolean;
   id: string;
   account_id: string | null;
   date: string;
@@ -133,7 +135,10 @@ export interface BillingReport {
   entries: BillingEntry[];
   source_notice: string;
 }
+export interface ImportBatch { id:string; filename:string; imported:number; duplicates:number; errors:{row:number;message:string}[]; undone:boolean; created_at:string; remaining_entries:number; removed_individually:number; }
+export interface PersonalRecord { id:string; name:string; amount_minor:number; currency:string; cycle:string; next_charge_on:string; category:string; note:string; reminder_enabled:boolean; lead_days:number; active:boolean; version:number; }
 export interface ImportResult {
+  batch_id?: string;
   imported: number;
   duplicates: number;
   errors: { row: number; message: string }[];
@@ -152,6 +157,7 @@ export interface Subscription {
   source: string;
 }
 export interface Candidate {
+  feedback: "confirmed"|"not_subscription"|"ignored"|"reset"|null; feedback_version:number; personal_record_id:string|null; evidence_entries:Pick<BillingEntry,"id"|"date"|"merchant"|"amount_minor"|"source"|"category">[];
   id: string;
   merchant: string;
   cycle: string;
@@ -165,6 +171,7 @@ export interface Candidate {
   is_subscription_candidate: boolean;
 }
 export interface SubscriptionList {
+  personal_records: PersonalRecord[];
   subscriptions: Subscription[];
   candidates: Candidate[];
 }
@@ -244,3 +251,28 @@ export interface TaskPreviewInput {
   total_minor?: number; participant_ids?: string[]; recipient_id?: string; amount_minor?: number;
   execute_at?: string; task_id?: string;
 }
+
+export interface WorkflowProduct {unit?:string;description?:string;id:string;merchant_id:string;merchant_name:string;name:string;price_minor:number;currency:string;version:number;cancel_supported:boolean}
+export interface WorkflowItem {unit?:string;product_id:string;merchant_name:string;name:string;quantity:number;unit_price_minor:number;total_minor:number}
+export interface WorkflowAction extends DomainAction {
+  kind:"workflow";action:"arrange"|"cancel";task_id:string|null;account_id:string;recipient_label:string;
+  budget_minor:number;total_minor:number;reserved_minor:number;execute_at:string|null;deadline_at:string|null;
+  execute_immediately?:boolean;
+  revision?:{before_total_minor?:number;after_total_minor?:number;source_plan_id:string;changes:{field:string;label:string;before:string;after:string;summary:string}[]};
+  items:WorkflowItem[];cancellation_notice:string;
+}
+export interface WorkflowStep extends WorkflowItem {
+  step_id:string;merchant_id:string;status:string;order_id:string|null;order_status:string|null;
+  operation_id:string|null;refund_operation_id:string|null;refunded_minor:number;refund_pending_minor:number;message:string;
+}
+export interface WorkflowTask {
+  id:string;title:string;recipient_label:string;account_id:string;budget_minor:number;total_minor:number;
+  reserved_minor:number;paid_minor:number;refunded_minor:number;refund_pending_minor:number;net_spent_minor:number;
+  status:string;execute_at:string;deadline_at:string;hold_id:string;steps:WorkflowStep[];conversation_id:string;
+  plan_id:string;related_plan_ids:string[];state_version:number;message:string;failure_code:string|null;
+}
+export interface WorkflowList {catalog:WorkflowProduct[];tasks:WorkflowTask[];now:string}
+export interface WorkflowInput {title?:string;action:"arrange"|"cancel";conversation_id:string;account_id?:string;recipient_label?:string;budget_minor?:number;items?:{product_id:string;quantity:number}[];execute_at?:string;task_id?:string}
+
+export interface Contact {id:string;name:string;note:string;bank_name:string;account_hint:string;account_last4:string;can_transfer:boolean;version:number;active:boolean}
+export interface ManagedService extends WorkflowProduct {unit:string;description:string;active:boolean}

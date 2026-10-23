@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { getBillingReport, importBilling, money } from "../api";
+import type { OpenRecord } from "./RecordPanel";
 import type { BillingReport, ImportResult } from "../types";
 const sourceNames: Record<string, string> = {
+  manual: "手工记账",
   bank: "模拟银行",
   demo: "演示账单",
   import: "CSV 导入",
@@ -13,25 +15,35 @@ const kindNames: Record<string, string> = {
   transfer: "转账",
   opening: "期初",
 };
-export function BillingPage({ revision, mode = "analysis" }: { revision: number; mode?: "entries"|"analysis"|"import" }) {
+export function BillingPage({ revision, mode = "analysis", onManage, managementBlocked = false }: { onManage?:OpenRecord; managementBlocked?:boolean; revision: number; mode?: "entries"|"analysis"|"import" }) {
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
+  const [query,setQuery]=useState("");const [category,setCategory]=useState("");const [source,setSource]=useState("");
+  const importRetry=useRef<{filename:string;content:string;id:string}|null>(null); const importLock=useRef(false);
   const [report, setReport] = useState<BillingReport | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [importing, setImporting] = useState(false);
   const [result, setResult] = useState<ImportResult | null>(null);
   const version = useRef(0);
-  async function refresh() {
+  const alive = useRef(true);
+  const latestRefresh = useRef(refresh);
+  latestRefresh.current = refresh;
+  useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
+  async function refresh(clear=false) {
     const v = ++version.current;
-    if (start && end && start > end) {
+    if (!clear && start && end && start > end) {
+      setBusy(false);
       setError("开始日期不能晚于结束日期。");
       return;
     }
     setBusy(true);
     setError("");
     try {
-      const data = await getBillingReport(start, end);
+      const data = await getBillingReport(clear?"":start, clear?"":end,clear?{}:{query,category,source});
       if (v === version.current) setReport(data);
     } catch (failure) {
       if (v === version.current)
@@ -47,23 +59,29 @@ export function BillingPage({ revision, mode = "analysis" }: { revision: number;
     };
   }, [revision]);
   async function importFile(file?: File) {
-    if (!file) return;
+    if (!file || importLock.current) return;
     setError("");
     setResult(null);
     if (file.size > 2 * 1024 * 1024) {
       setError("CSV 文件不能超过 2 MiB。");
       return;
     }
+    importLock.current=true;
     setImporting(true);
     try {
       const content = await file.text();
-      const data = await importBilling(file.name, content);
+      if (!alive.current) return;
+      if (!importRetry.current || importRetry.current.filename!==file.name || importRetry.current.content!==content) importRetry.current={filename:file.name,content,id:crypto.randomUUID()};
+      const data = await importBilling(file.name, content, importRetry.current.id);
+      importRetry.current=null;
+      if (!alive.current) return;
       setResult(data);
-      await refresh();
+      await latestRefresh.current();
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : "CSV 导入失败。");
+      if (alive.current) setError(failure instanceof Error ? failure.message : "CSV 导入失败。");
     } finally {
-      setImporting(false);
+      importLock.current=false;
+      if (alive.current) setImporting(false);
     }
   }
   return (
@@ -73,7 +91,7 @@ export function BillingPage({ revision, mode = "analysis" }: { revision: number;
         <p>{mode === "entries" ? "每一笔收支，清楚可查。" : mode === "import" ? "导入 CSV 账单，整理分类与重复记录。" : "分类与周期来自账单规则，异常仅供复核；暂不支持设置预算。"}</p>
       </div>
       <form
-        className="filter-bar"
+        className="filter-bar record-filters"
         onSubmit={(event) => {
           event.preventDefault();
           void refresh();
@@ -100,6 +118,11 @@ export function BillingPage({ revision, mode = "analysis" }: { revision: number;
         <button className="button secondary" disabled={busy}>
           查询
         </button>
+        <label>商户或备注<input aria-label="搜索商户或备注" maxLength={160} value={query} onChange={e=>setQuery(e.target.value)}/></label>
+        <label>类别<input aria-label="筛选类别" maxLength={80} value={category} onChange={e=>setCategory(e.target.value)}/></label>
+        <label>来源<select aria-label="筛选来源" value={source} onChange={e=>setSource(e.target.value)}><option value="">全部来源</option>{Object.entries(sourceNames).map(([id,label])=><option key={id} value={id}>{label}</option>)}</select></label>
+        <button type="button" className="text-button" onClick={()=>{setStart("");setEnd("");setQuery("");setCategory("");setSource("");void refresh(true);}}>清除筛选</button>
+        {onManage&&<button type="button" className="button secondary" disabled={managementBlocked} onClick={()=>onManage({kind:"entry"})}>手工记账</button>}
         {mode === "import" && <><label className="button secondary file-button">
           {importing ? "正在导入…" : "导入 CSV"}
           <input
@@ -115,7 +138,7 @@ export function BillingPage({ revision, mode = "analysis" }: { revision: number;
         </label>
         <a className="text-button" href="/api/billing/sample" download>
           下载示例
-        </a></>}
+        </a>{onManage&&<button type="button" className="button secondary" disabled={managementBlocked} onClick={()=>onManage({kind:"batches"})}>导入记录</button>}</>}
       </form>
       {error && (
         <p className="inline-error" role="alert">
@@ -206,7 +229,7 @@ export function BillingPage({ revision, mode = "analysis" }: { revision: number;
                   <th>商户</th>
                   <th>分类 / 类型</th>
                   <th>金额</th>
-                  {mode !== "entries" && <th>规则依据</th>}
+                  {mode !== "entries" && <th>规则依据</th>}<th>备注 / 标签</th>{onManage&&<th>操作</th>}
                 </tr>
               </thead>
               <tbody>
@@ -233,7 +256,7 @@ export function BillingPage({ revision, mode = "analysis" }: { revision: number;
                     <td className={entry.amount_minor > 0 ? "positive" : ""}>
                       {money(entry.amount_minor, entry.currency)}
                     </td>
-                    {mode !== "entries" && <td>{entry.reason}</td>}
+                    {mode !== "entries" && <td>{entry.reason}</td>}<td className="record-note">{entry.note||"—"}<small>{entry.tags?.join(" · ")}</small></td>{onManage&&<td><button className="text-button" disabled={managementBlocked} onClick={()=>onManage({kind:"entry",entry})}>整理</button></td>}
                   </tr>
                 ))}
               </tbody>

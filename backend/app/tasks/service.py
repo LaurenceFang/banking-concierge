@@ -416,11 +416,9 @@ class TasksService:
                 )
                 return _payment_receipt(task, participant, duplicate=False)
 
-            recipient = _validated_recipient(session, participant_id)
+            recipient = _validated_recipient(session, participant_id, include_inactive=True)
             destination = accounts[destination_id]
             _require_external_recipient(recipient, destination)
-            if recipient.destination_account_id != destination_id:
-                raise BankError("RECIPIENT_CHANGED", "成员收款账户已变更，不能按原预览模拟付款。")
             operation_id = _stable_operation("aa-pay", task.id, participant.participant_id)
             transfer_funds(
                 session,
@@ -636,6 +634,7 @@ class TasksService:
             or source.owner_id != DEMO_USER_ID
             or recipient is None
             or recipient.owner_id != DEMO_USER_ID
+            or not recipient.active
             or recipient.destination_account_id != plan.destination_account_id
             or destination is None
             or destination.owner_id == DEMO_USER_ID
@@ -834,8 +833,6 @@ class TasksService:
             if (
                 recipient is None
                 or recipient.owner_id != DEMO_USER_ID
-                or recipient.destination_account_id != task.destination_account_id
-                or recipient.name != task.recipient_name
                 or destination is None
                 or destination.owner_id == DEMO_USER_ID
                 or source is None
@@ -985,7 +982,9 @@ def _split_amount(total_minor: int, participants: list[dict[str, Any]]) -> list[
     return [quotient + (1 if index < remainder else 0) for index in range(len(participants))]
 
 
-def _validated_recipient(session: Session, recipient_id: str) -> Recipient:
+def _validated_recipient(
+    session: Session, recipient_id: str, *, include_inactive: bool = False
+) -> Recipient:
     if not isinstance(recipient_id, str) or not recipient_id:
         raise BankError("INVALID_RECIPIENT", "请选择已保存的收款人编号。")
     recipient = session.scalar(
@@ -993,6 +992,8 @@ def _validated_recipient(session: Session, recipient_id: str) -> Recipient:
     )
     if recipient is None:
         raise BankError("RECIPIENT_NOT_FOUND", "未找到当前演示用户已保存的该收款人。")
+    if not include_inactive and not recipient.active:
+        raise BankError("RECIPIENT_NOT_FOUND", "该联系人已从可选列表移除，请选择其他联系人。")
     return recipient
 
 
@@ -1294,6 +1295,7 @@ def _participants_still_match(session: Session, participants: list[dict[str, obj
         if (
             recipient is None
             or recipient.owner_id != DEMO_USER_ID
+            or not recipient.active
             or recipient.destination_account_id != item.get("destination_account_id")
             or recipient.name != item.get("name")
         ):

@@ -11,7 +11,10 @@ def test_task_form_recipient_choices_are_real_scoped_and_disambiguated(tmp_path)
             "demo-recipient-chen", "demo-recipient-zhang-1",
             "demo-recipient-zhang-2", "demo-recipient-li",
         }
-        assert all(set(item) == {"id", "name", "bank_name", "account_hint"} for item in all_items)
+        assert all(set(item) == {
+            "id", "name", "bank_name", "account_hint", "note", "can_transfer", "version", "active"
+        } for item in all_items)
+        assert all(item["can_transfer"] for item in all_items)
         namesakes = client.get("/api/tasks/recipients", params={"query": "张伟"}).json()["recipients"]
         assert len(namesakes) == 2
         assert len({item["account_hint"] for item in namesakes}) == 2

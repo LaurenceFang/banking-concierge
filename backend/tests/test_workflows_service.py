@@ -9,7 +9,7 @@ from app.bank.models import Account, FundHold, LedgerTransaction
 from app.bank.service import BankService
 from app.task_clock import TaskClock
 from app.workflows import WorkflowService
-from app.workflows.models import WorkflowCatalogItem, WorkflowMerchantOrder
+from app.workflows.models import WorkflowCatalogItem, WorkflowMerchant, WorkflowMerchantOrder
 from sqlalchemy import select
 
 
@@ -65,7 +65,9 @@ def test_normal_flow_reserves_exact_quote_and_posts_simulated_merchant_spend(sce
 
     assert plan["total_minor"] == 32_800
     assert plan["reserved_minor"] == 32_800
-    assert [row["price_minor"] for row in workflow.catalog()] == [12_900, 19_900]
+    assert [(row["id"], row["price_minor"]) for row in workflow.catalog()] == [
+        ("flowers-basic", 19_900), ("cake-basic", 12_900)
+    ]
     accepted = workflow.decide_plan(plan["id"], "approve")
     task = workflow.get_task(plan["task_id"])
 
@@ -283,3 +285,156 @@ def test_two_workers_process_due_task_once_and_expired_window_releases_hold(scen
     assert expired["reserved_minor"] == 0
     assert all(step["status"] == "failed" for step in expired["steps"])
     assert _balance(workflow, "demo-checking-001") == 9_100_567 - 32_800
+
+
+def _single_service_plan(workflow, service, *, budget=None, execute_at=None, title=""):
+    return workflow.create_action_plan(
+        "arrange",
+        "custom-service-chat",
+        account_id="demo-checking-001",
+        recipient_label="家人",
+        budget_minor=budget or service["price_minor"],
+        items=[{"product_id": service["id"], "quantity": 1}],
+        execute_at=execute_at,
+        title=title or None,
+    )
+
+
+def test_custom_service_runs_through_real_simulated_payment_and_original_order_refund(scenario):
+    _bank, _clock, workflow, _url = scenario
+    source_before = _balance(workflow, "demo-checking-001")
+    service = workflow.create_service(
+        "节日贺卡",
+        "小岛手作",
+        2_900,
+        unit="张",
+        description="简约手写贺卡",
+        cancel_supported=True,
+        client_request_id="custom-card-once",
+    )
+    assert service["active"] is True
+    assert service["merchant_name"] == "小岛手作"
+    assert workflow.create_service(
+        "ignored retry",
+        "other merchant",
+        8_800,
+        client_request_id="custom-card-once",
+    )["id"] == service["id"]
+
+    plan = _single_service_plan(workflow, service, title="家人的节日卡片")
+    accepted = workflow.decide_plan(plan["id"], "approve")
+    task = workflow.get_task(plan["task_id"])
+    assert accepted["task_status"] == "completed"
+    assert task["title"] == "家人的节日卡片"
+    assert task["paid_minor"] == 2_900
+    assert task["net_spent_minor"] == 2_900
+    assert _balance(workflow, "demo-checking-001") == source_before - 2_900
+
+    with workflow._session_factory() as session:
+        merchant = session.get(WorkflowMerchant, service["merchant_id"])
+        order = session.scalar(
+            select(WorkflowMerchantOrder).where(WorkflowMerchantOrder.task_id == task["id"])
+        )
+        assert merchant is not None
+        merchant_account_id = merchant.account_id
+        assert order is not None and order.status == "CONFIRMED"
+        assert order.amount_minor == 2_900
+    assert _balance(workflow, merchant_account_id) == 2_900
+
+    cancel = workflow.create_action_plan("cancel", "custom-service-cancel", task_id=task["id"])
+    workflow.decide_plan(cancel["id"], "approve")
+    refunded = workflow.get_task(task["id"])
+    assert refunded["status"] == "cancelled"
+    assert refunded["paid_minor"] == 2_900
+    assert refunded["refunded_minor"] == 2_900
+    assert refunded["net_spent_minor"] == 0
+    assert _balance(workflow, "demo-checking-001") == source_before
+    assert _balance(workflow, merchant_account_id) == 0
+
+
+def test_scheduled_custom_service_keeps_confirmed_price_merchant_and_cancel_snapshot(scenario):
+    _bank, clock, workflow, _url = scenario
+    source_before = _balance(workflow, "demo-checking-001")
+    service = workflow.create_service("手作礼盒", "旧商户", 3_499, cancel_supported=True)
+    old_merchant_id = service["merchant_id"]
+    old_merchant_account = workflow._merchant_account(
+        workflow._session_factory(), old_merchant_id
+    )
+    scheduled = _single_service_plan(
+        workflow,
+        service,
+        execute_at=clock.now() + timedelta(minutes=30),
+        title="周末礼盒安排",
+    )
+    workflow.decide_plan(scheduled["id"], "approve")
+    assert _balance(workflow, "demo-checking-001") == source_before
+
+    edited = workflow.update_service(
+        service["id"],
+        version=service["version"],
+        merchant_name="新商户",
+        price_minor=8_800,
+        cancel_supported=False,
+    )
+    assert edited["version"] == 2
+    removed = workflow.remove_service(service["id"], version=edited["version"])
+    assert removed["active"] is False
+    workflow.seed_demo()
+    assert service["id"] not in {row["id"] for row in workflow.catalog()}
+
+    clock.advance(30)
+    workflow.process_due()
+    task = workflow.get_task(scheduled["task_id"])
+    assert task["status"] == "completed"
+    assert task["title"] == "周末礼盒安排"
+    assert task["paid_minor"] == 3_499
+    assert task["steps"][0]["merchant_id"] == old_merchant_id
+    assert task["steps"][0]["merchant_name"] == "旧商户"
+    assert _balance(workflow, old_merchant_account) == 3_499
+
+    cancel = workflow.create_action_plan("cancel", "scheduled-custom-cancel", task_id=task["id"])
+    workflow.decide_plan(cancel["id"], "approve")
+    final = workflow.get_task(task["id"])
+    assert final["status"] == "cancelled"
+    assert final["refunded_minor"] == 3_499
+    assert final["net_spent_minor"] == 0
+    assert _balance(workflow, "demo-checking-001") == source_before
+    assert _balance(workflow, old_merchant_account) == 0
+    with workflow._session_factory() as session:
+        current_merchant = session.scalar(
+            select(WorkflowMerchant).where(WorkflowMerchant.name == "新商户")
+        )
+        assert current_merchant is not None
+        assert _balance(workflow, current_merchant.account_id) == 0
+
+
+def test_custom_non_cancellable_service_keeps_payment_after_cancel_request(scenario):
+    _bank, _clock, workflow, _url = scenario
+    source_before = _balance(workflow, "demo-checking-001")
+    service = workflow.create_service("定制刻字", "刻字工坊", 1_250, cancel_supported=False)
+    plan = _single_service_plan(workflow, service)
+    workflow.decide_plan(plan["id"], "approve")
+    task = workflow.get_task(plan["task_id"])
+    assert task["status"] == "completed"
+    assert task["title"] == "给家人的服务安排"
+
+    cancel = workflow.create_action_plan("cancel", "non-cancellable-cancel", task_id=task["id"])
+    workflow.decide_plan(cancel["id"], "approve")
+    final = workflow.get_task(task["id"])
+    assert final["status"] == "partial"
+    assert final["paid_minor"] == 1_250
+    assert final["refunded_minor"] == 0
+    assert final["net_spent_minor"] == 1_250
+    assert "不支持取消" in final["steps"][0]["message"]
+    assert _balance(workflow, "demo-checking-001") == source_before - 1_250
+
+
+def test_editing_pending_custom_service_invalidates_confirmation(scenario):
+    _bank, _clock, workflow, _url = scenario
+    service = workflow.create_service("定制卡片", "纸间商店", 2_000)
+    plan = _single_service_plan(workflow, service)
+    workflow.update_service(service["id"], version=service["version"], price_minor=2_500)
+
+    with pytest.raises(BankError) as error:
+        workflow.decide_plan(plan["id"], "approve")
+    assert error.value.code == "PLAN_INVALIDATED"

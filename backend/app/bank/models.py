@@ -5,11 +5,14 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -57,6 +60,23 @@ class Recipient(Base):
     bank_name: Mapped[str] = mapped_column(String(120), nullable=False)
     account_last4: Mapped[str] = mapped_column(String(4), nullable=False)
     destination_account_id: Mapped[str] = mapped_column(ForeignKey("bank_accounts.id"), nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
+class ContactCreateRequest(Base):
+    """Idempotency record for contact creation initiated by the UI."""
+
+    __tablename__ = "bank_contact_create_requests"
+    __table_args__ = (UniqueConstraint("owner_id", "client_request_id", name="uq_contact_create_request"),)
+
+    id: Mapped[str] = mapped_column(String(220), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("bank_users.id"), nullable=False)
+    client_request_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    request_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    recipient_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class LedgerTransaction(Base):
@@ -89,6 +109,7 @@ class TransferPlan(Base):
     owner_id: Mapped[str] = mapped_column(ForeignKey("bank_users.id"), nullable=False)
     source_account_id: Mapped[str] = mapped_column(ForeignKey("bank_accounts.id"), nullable=False)
     recipient_id: Mapped[str] = mapped_column(ForeignKey("bank_recipients.id"), nullable=False)
+    recipient_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     destination_account_id: Mapped[str] = mapped_column(ForeignKey("bank_accounts.id"), nullable=False)
     amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
     fee_minor: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)

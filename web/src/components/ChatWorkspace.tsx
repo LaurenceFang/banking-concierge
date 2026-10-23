@@ -128,6 +128,7 @@ export function ChatWorkspace({
   }
   function renderMessage(message: ChatMessage) {
     const actionId = message.action?.id ?? message.plan?.id;
+    const workflowMessage = message.action?.kind === "workflow" || Array.isArray(message.receipt?.steps);
     return (
       <article className={`message ${message.role}`} key={message.id} tabIndex={0}
         aria-label={message.role === "user" ? "你的消息" : message.role === "notification" ? "业务通知" : "银小二的回复"}>
@@ -164,7 +165,8 @@ export function ChatWorkspace({
               查看确认单 <span aria-hidden="true">›</span>
             </button>
           )}
-          {(message.action?.kind === "transfer" || message.action?.kind === "task" || message.receipt?.task_id || message.plan) && <a className="text-button action-link" href="#/bills/payments">查看收付款 ›</a>}
+          {workflowMessage && <a className="text-button action-link" href="#/life/arrangements">查看我的安排 ›</a>}
+          {!workflowMessage && (message.action?.kind === "transfer" || message.action?.kind === "task" || message.receipt?.task_id || message.plan) && <a className="text-button action-link" href="#/bills/payments">查看收付款 ›</a>}
           {message.receipt && (
             <div className="receipt">
               {message.role !== "notification" && <p>{message.receipt.message}</p>}

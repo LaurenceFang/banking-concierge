@@ -19,6 +19,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -27,8 +28,21 @@ class WorkflowBase(DeclarativeBase):
     pass
 
 
+class WorkflowMerchant(WorkflowBase):
+    __tablename__ = "workflow_merchants"
+    __table_args__ = (UniqueConstraint("name", name="uq_workflow_merchants_name"),)
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    account_id: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+
+
 class WorkflowCatalogItem(WorkflowBase):
     __tablename__ = "workflow_catalog_items"
+    __table_args__ = (
+        Index("uq_workflow_catalog_client_request_id", "client_request_id", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(80), primary_key=True)
     merchant_id: Mapped[str] = mapped_column(String(80), nullable=False)
@@ -38,6 +52,10 @@ class WorkflowCatalogItem(WorkflowBase):
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="CNY")
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     cancel_supported: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    unit: Mapped[str] = mapped_column(String(40), nullable=False, default="份")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    client_request_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
 
 class WorkflowPlan(WorkflowBase):
@@ -49,12 +67,20 @@ class WorkflowPlan(WorkflowBase):
 
     id: Mapped[str] = mapped_column(String(100), primary_key=True)
     action: Mapped[str] = mapped_column(String(16), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(160), nullable=True)
     task_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     account_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     recipient_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
     budget_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     total_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     items_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    revision_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    execute_immediately: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=false(),
+    )
     execute_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending")
@@ -80,6 +106,7 @@ class WorkflowTask(WorkflowBase):
 
     id: Mapped[str] = mapped_column(String(100), primary_key=True)
     plan_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    title: Mapped[str | None] = mapped_column(String(160), nullable=True)
     account_id: Mapped[str] = mapped_column(String(80), nullable=False)
     recipient_label: Mapped[str] = mapped_column(String(120), nullable=False)
     budget_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)

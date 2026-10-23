@@ -29,10 +29,11 @@ class WorkflowRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     action: Literal["arrange", "cancel"]
     conversation_id: str
+    title: str | None = Field(default=None, max_length=120)
     account_id: str | None = None
     recipient_label: str | None = Field(default=None, max_length=120)
     budget_minor: int | None = Field(default=None, strict=True)
-    items: list[WorkflowItem] | None = None
+    items: list[WorkflowItem] | None = Field(default=None, max_length=10)
     execute_at: str | None = None
     task_id: str | None = None
 
@@ -55,7 +56,7 @@ def task_router(app, preview_domain, decide_domain):
 
     @router.get("/tasks/recipients")
     def recipients(query: str = Query(default="", max_length=120)):
-        fields = ("id", "name", "bank_name", "account_hint")
+        fields = ("id", "name", "bank_name", "account_hint", "note", "can_transfer", "version", "active")
         return {"recipients": [
             {key: recipient[key] for key in fields}
             for recipient in app.state.bank.list_recipients(query)

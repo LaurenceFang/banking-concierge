@@ -2,7 +2,7 @@ export const sections = {
   accounts: [["overview", "资金总览"], ["accounts", "我的账户"], ["cards", "银行卡"]],
   bills: [["entries", "收支明细"], ["payments", "收付款"], ["analysis", "分析与预算"], ["import", "导入整理"]],
   wealth: [["positions", "我的持仓"], ["products", "产品比较"], ["orders", "理财订单"], ["risk", "风险档案"]],
-  life: [["subscriptions", "订阅与周期支出"]],
+  life: [["subscriptions", "订阅与周期支出"], ["arrangements", "我的安排"]],
 } as const;
 export type Domain = keyof typeof sections;
 export function validScope(value: string): string | undefined {

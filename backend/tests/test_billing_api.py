@@ -135,4 +135,8 @@ def test_api_exposes_rule_provenance_without_claiming_model_classification(clien
         "source",
         "confidence",
         "reason",
+        "tags",
+        "note",
+        "version",
+        "editable",
     }

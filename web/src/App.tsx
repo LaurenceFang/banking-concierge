@@ -7,11 +7,14 @@ import { ChatWorkspace } from "./components/ChatWorkspace";
 import { ActionDrawer } from "./components/ActionDrawer";
 import { BillingPage } from "./components/BillingPage";
 import { PaymentsPage } from "./components/PaymentsPage";
+import { ArrangementsPage } from "./components/ArrangementsPage";
 import { SubscriptionsPage } from "./components/SubscriptionsPage";
 import { CardsPage } from "./components/CardsPage";
 import { WealthPage } from "./components/WealthPage";
 import { sections, routeFromHash, routeHash, type Domain } from "./workspace";
 import { ConversationTitle, ConversationMenu, ConversationGroup, splitConversationGroups, useConversationGroups, useRailResize, type ConversationMenuTarget } from "./components/SidebarControls";
+import { ManagementPanel, type ManagementRequest } from "./components/ManagementPanel";
+import { RecordPanel, type RecordRequest } from "./components/RecordPanel";
 import { useSidePanelResize } from "./components/useSidePanelResize";
 const nav = [{id:"accounts",label:"账户",icon:CreditCard},{id:"bills",label:"账单",icon:ReceiptText},{id:"wealth",label:"财富",icon:ChartNoAxesCombined},{id:"life",label:"生活",icon:CalendarDays}] as const;
 const read = (key:string) => {try{return localStorage.getItem(key);}catch{return null;}};
@@ -19,6 +22,10 @@ const save = (key:string,value:string) => {try{localStorage.setItem(key,value);}
 export default function App() {
   const rail = useRailResize();
   const sidePanel = useSidePanelResize();
+  const [management,setManagement]=useState<ManagementRequest|RecordRequest|null>(null);
+  const managementTrigger=useRef<HTMLElement|null>(null);
+  function openManagement(request:ManagementRequest|RecordRequest){if(pending||chatBusy||decisionBusy||actionBusy)return;managementTrigger.current=document.activeElement as HTMLElement;setManagement(request);}
+  function closeManagement(){setManagement(null);requestAnimationFrame(()=>managementTrigger.current?.focus());}
   const [contextMenu, setContextMenu] = useState<ConversationMenuTarget | null>(null);
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
   const [route,setRoute] = useState(()=>routeFromHash(location.hash));
@@ -30,6 +37,14 @@ export default function App() {
   const [pinBusy, setPinBusy] = useState<Set<string>>(new Set());
   const [pinError, setPinError] = useState("");
   const [collapsed,setCollapsed]=useState(()=>read("yx2.rail.v1")==="closed" || innerWidth<760);
+  useEffect(()=>{
+    if(!management)return;
+    const narrow=window.matchMedia("(max-width: 759px)");
+    const collapseForManagement=()=>{if(narrow.matches)setCollapsed(true);};
+    collapseForManagement();
+    narrow.addEventListener("change",collapseForManagement);
+    return()=>narrow.removeEventListener("change",collapseForManagement);
+  },[management]);
   const [conversations,setConversations]=useState<Conversation[]>([]);
   const [main,setMain]=useState<Conversation|null>(null);
   const mainRef=useRef<Conversation|null>(null);
@@ -40,6 +55,8 @@ export default function App() {
   const [activeId,setActiveId]=useState(""); const activeRef=useRef("");
   const [detail,setDetail]=useState<ConversationDetail|null>(null);
   const [pending,setPending]=useState<Action|null>(null);
+  const [workflowDirty,setWorkflowDirty]=useState(false);
+  const [workflowEditing,setWorkflowEditing]=useState(false);
   const [drawer,setDrawer]=useState(false);
   const dismissed=useRef(new Set<string>((() => {try {const values=JSON.parse(read("yx2.closed.v2")??"[]");return Array.isArray(values)?values.filter((x):x is string=>typeof x==="string"):[];}catch{return [];}})()));
   const [overview,setOverview]=useState<Overview|null>(null);
@@ -48,7 +65,7 @@ export default function App() {
   const [revision,setRevision]=useState(0);const [renaming,setRenaming]=useState("");const [title,setTitle]=useState("");
   const [profileOpen,setProfileOpen]=useState(false);
   const go=useCallback((nextScope?:string,id="",expanded=false)=>{location.hash=routeHash(nextScope,id,expanded);},[]);
-  useEffect(()=>{const changed=()=>setRoute(routeFromHash(location.hash));window.addEventListener("hashchange",changed);return()=>window.removeEventListener("hashchange",changed);},[]);
+  useEffect(()=>{const changed=()=>{if(decisionBusy||(workflowDirty&&!window.confirm("放弃尚未保存的修改？"))){history.replaceState(null,"",routeHash(routeRef.current.scope,routeRef.current.conversation,routeRef.current.expanded));return;}setWorkflowDirty(false);setWorkflowEditing(false);setRoute(routeFromHash(location.hash));};window.addEventListener("hashchange",changed);return()=>window.removeEventListener("hashchange",changed);},[workflowDirty,decisionBusy]);
   const refreshOverview=useCallback(async()=>{setLoading(true);try{setOverview(await getOverview());setOverviewError("");}catch(e){setOverviewError(e instanceof Error?e.message:"无法读取账户。");}finally{setLoading(false);}},[]);
   const refreshList=useCallback(async()=>{const v=++listVersion.current;const requested=routeRef.current.scope;try{const result=await getConversations(requested);if(v!==listVersion.current || requested!==routeRef.current.scope)return;setConversations(result.conversations);setListScope(requested);const m=result.conversations.find(x=>x.kind==="main");if(m){mainRef.current=m;setMain(m);}setListLoading(false);}catch(e){if(v===listVersion.current){setListLoading(false);setError(e instanceof Error?e.message:"无法读取对话列表。");}}},[]);
   const acceptAction=useCallback((action:Action|null)=>{const live=action?.status==="pending"?action:null;setPending(live);if(live && !dismissed.current.has(`${activeRef.current}:${live.id}`))setDrawer(true);},[]);
@@ -62,11 +79,11 @@ export default function App() {
     if(id.startsWith("compose:"))setDetail({conversation:{id,title:"新对话",kind:"temporary",updated_at:new Date().toISOString(),unread_count:0,pinned:false,pinned_at:null,scopes:scope?[scope]:[]},messages:[],pending_action:null});
     else if(id)void loadConversation(id);
   },[route.conversation,scope,main?.id,loadConversation]);
-  useEffect(()=>{const timer=window.setInterval(()=>{if(document.hidden)return;void refreshList();const id=activeRef.current;if(id && !id.startsWith("compose:") && !chatBusy && !decisionBusy && !actionBusy && !renaming && !read(`yx2.draft.${id}`))void loadConversation(id);},20000);return()=>clearInterval(timer);},[refreshList,loadConversation,chatBusy,decisionBusy,actionBusy,renaming]);
+  useEffect(()=>{const timer=window.setInterval(()=>{if(document.hidden)return;void refreshList();const id=activeRef.current;if(id && !id.startsWith("compose:") && !chatBusy && !decisionBusy && !workflowEditing && !actionBusy && !renaming && !read(`yx2.draft.${id}`))void loadConversation(id);},20000);return()=>clearInterval(timer);},[refreshList,loadConversation,chatBusy,decisionBusy,workflowEditing,actionBusy,renaming]);
   const home=()=>{setCollapsed(false);go(undefined,mainRef.current?.id);};
   const create=(draft="")=>{const id=`compose:${crypto.randomUUID()}`;if(draft)save(`yx2.draft.${id}`,draft);go(scope,id);if(innerWidth<760)setCollapsed(true);};
-  const closeDrawer=()=>{if(pending){dismissed.current.add(`${activeId}:${pending.id}`);save("yx2.closed.v2",JSON.stringify([...dismissed.current].slice(-200)));}setDrawer(false);};
-  useEffect(()=>{const escape=(event:KeyboardEvent)=>{if(event.key!=="Escape")return;if(drawer)closeDrawer();else if(scope && route.conversation)go(scope);};window.addEventListener("keydown",escape);return()=>window.removeEventListener("keydown",escape);},[drawer,pending,activeId,scope,route.conversation,go]);
+  const closeDrawer=()=>{if(decisionBusy)return;if(workflowDirty&&!window.confirm("放弃尚未保存的修改？"))return;setWorkflowEditing(false);setWorkflowDirty(false);if(pending){dismissed.current.add(`${activeId}:${pending.id}`);save("yx2.closed.v2",JSON.stringify([...dismissed.current].slice(-200)));}setDrawer(false);};
+  useEffect(()=>{const escape=(event:KeyboardEvent)=>{if(event.key!=="Escape" || management)return;if(drawer)closeDrawer();else if(scope && route.conversation)go(scope);};window.addEventListener("keydown",escape);return()=>window.removeEventListener("keydown",escape);},[drawer,pending,activeId,scope,route.conversation,go,management,workflowEditing,workflowDirty,decisionBusy]);
   function refreshCurrent(){void refreshOverview();void refreshList();if(activeRef.current && !activeRef.current.startsWith("compose:"))void loadConversation(activeRef.current);setRevision(v=>v+1);}
   async function ensureConversation(existingId?:string){const expected=scope;const item=existingId?{id:existingId}:await createConversation(scope,crypto.randomUUID());if(routeRef.current.scope===expected){activeRef.current=item.id;setActiveId(item.id);setDetail(null);go(scope,item.id);}void refreshList();return item.id;}
   function pageAction(action:Action){if(action.conversation_id!==activeRef.current)return;acceptAction(action);if(action.conversation_id)void loadConversation(action.conversation_id);}
@@ -97,14 +114,14 @@ export default function App() {
   const chatVisible=!!detail && (!business || !!route.conversation);
   const heading=business?nav.find(x=>x.id===domain)?.label:current?.kind==="main"?"主对话":current?.title??"主对话";
   const pageProps={conversationId:activeId,ensureConversation,revision,blocked:chatBusy||decisionBusy,onBusy:setActionBusy,onAction:pageAction};
-  const chat=detail && <ChatWorkspace key={activeId} detail={detail} scope={scope} pending={pending} onAction={action=>{if(activeRef.current===activeId)acceptAction(action);}} onOpen={()=>setDrawer(true)} onRefresh={()=>{if(activeRef.current===activeId)refreshCurrent();}} onCreated={id=>{if(activeRef.current===activeId){go(scope,id,routeRef.current.expanded);void refreshList();}}} onBusy={value=>{if(activeRef.current===activeId){if(value)++loadVersion.current;setChatBusy(value);}}} decisionBusy={decisionBusy||actionBusy}/>;
+  const chat=detail && <ChatWorkspace key={activeId} detail={detail} scope={scope} pending={pending} onAction={action=>{if(activeRef.current===activeId)acceptAction(action);}} onOpen={()=>setDrawer(true)} onRefresh={()=>{if(activeRef.current===activeId)refreshCurrent();}} onCreated={id=>{if(activeRef.current===activeId){go(scope,id,routeRef.current.expanded);void refreshList();}}} onBusy={value=>{if(activeRef.current===activeId){if(value)++loadVersion.current;setChatBusy(value);}}} decisionBusy={decisionBusy||workflowEditing||actionBusy}/>;
   function conversationRow(item: Conversation) {
     return <div aria-busy={pinBusy.has(item.id)} key={item.id} className={`conversation-row ${activeId===item.id?"selected":""}`}>
           {renaming===item.id?<form className="rename-form" onKeyDown={e=>{if(e.key==="Escape"){e.stopPropagation();setRenaming("");}}} onSubmit={e=>{e.preventDefault();void rename();}}><input autoFocus aria-label="对话名称" value={title} onChange={e=>setTitle(e.target.value)} maxLength={80}/><button>保存</button><button type="button" onClick={()=>setRenaming("")}>取消</button></form>:<><button className="conversation-select" title={item.title} aria-label={item.title} aria-haspopup="menu" onContextMenu={e=>{e.preventDefault();setContextMenu({id:item.id,title:item.title,pinned:item.pinned,x:e.clientX,y:e.clientY,trigger:e.currentTarget});}} onKeyDown={e=>{if(e.key==="ContextMenu" || (e.shiftKey && e.key==="F10")){e.preventDefault();const rect=e.currentTarget.getBoundingClientRect();setContextMenu({id:item.id,title:item.title,pinned:item.pinned,x:rect.left+20,y:rect.bottom,trigger:e.currentTarget});}}} onClick={()=>{go(scope,item.id);if(innerWidth<760)setCollapsed(true);}}><ConversationTitle title={item.title}/>{item.unread_count>0 && <small className="unread">{item.unread_count}</small>}</button></>}
         </div>;
   }
   return <div style={{...rail.style,...sidePanel.style}} className={`app-shell ${collapsed?"rail-collapsed":""} ${rail.dragging?"rail-resizing":""} ${sidePanel.dragging?"side-resizing":""}`}>
-    <nav className="nav-rail" aria-label="主导航">
+    <nav inert={!!management} className="nav-rail" aria-label="主导航">
       <div className="rail-brand"><button className="brand-home" onClick={home} aria-label="返回主页"><House size={21}/>{!collapsed && <span>银小二</span>}</button><button className="icon-button" aria-label={collapsed?"展开会话栏":"收起会话栏"} onClick={()=>{setCollapsed(!collapsed);save("yx2.rail.v1",collapsed?"open":"closed");}}>{collapsed?<ChevronsRight size={18}/>:<ChevronsLeft size={18}/>}</button></div>
       <button className="new-conversation" aria-label="新建对话" onClick={()=>create()}><Plus size={20}/>{!collapsed && <span>新建对话</span>}</button>
       <button className={`conversation-select main-conversation ${!scope && current?.kind==="main"?"selected":""}`} onClick={home} title="主对话"><MessageCircle size={18}/>{!collapsed && <span>主对话</span>}</button>
@@ -125,15 +142,16 @@ export default function App() {
     </nav>
     {contextMenu && <ConversationMenu target={contextMenu} busy={pinBusy.has(contextMenu.id)} onPin={()=>void togglePin(contextMenu)} onClose={closeContextMenu} onRename={()=>{setRenaming(contextMenu.id);setTitle(contextMenu.title);setContextMenu(null);}}/>}
     {!collapsed && <button className="rail-backdrop" aria-label="关闭会话导航" onClick={()=>setCollapsed(true)}/>}
-    <main className="main-shell"><header className={`app-header ${!business ? "chat-page-header" : ""}`}><div className="workspace-heading">{scope && route.expanded && <button className="icon-button" aria-label="返回业务页" onClick={()=>go(scope,activeId)}><ArrowLeft size={19}/></button>}<h1 title={heading}>{!business ? <ConversationTitle title={heading ?? "主对话"}/> : heading}</h1></div><div className="header-tools"><button className="icon-button" aria-label="刷新当前内容" disabled={chatBusy||decisionBusy||actionBusy} onClick={refreshCurrent}><RefreshCw size={17}/></button><span>模拟银行</span></div></header>
+    <main className="main-shell"><header inert={!!management} className={`app-header ${!business ? "chat-page-header" : ""}`}><div className="workspace-heading">{scope && route.expanded && <button className="icon-button" aria-label="返回业务页" onClick={()=>go(scope,activeId)}><ArrowLeft size={19}/></button>}<h1 title={heading}>{!business ? <ConversationTitle title={heading ?? "主对话"}/> : heading}</h1></div><div className="header-tools"><button className="icon-button" aria-label="刷新当前内容" disabled={chatBusy||decisionBusy||actionBusy} onClick={refreshCurrent}><RefreshCw size={17}/></button><span>模拟银行</span></div></header>
       {error && <div className="shell-error" role="alert">{error}<button className="text-button" onClick={refreshCurrent}>重试</button></div>}
-      {business && <nav className="section-tabs" aria-label={`${heading}二级导航`}>{sections[domain!].map(([id,label])=><button key={id} className={id===section?"active":""} aria-current={id===section?"page":undefined} onClick={()=>go(`${domain}/${id}`)}>{label}</button>)}</nav>}
-      <div ref={sidePanel.workspaceRef} className={`workspace-layout ${sidePanel.overlay?"side-overlay":""} ${chatVisible && business && !drawer?"with-chat-panel":""}`}>
-        <div className={`workspace-content ${!business && detail ? "hidden" : ""}`}>
-          {!business ? <p className="loading-copy">{error?"暂时无法读取对话。":"正在恢复对话…"}</p> : domain==="bills" ? section==="payments"?<PaymentsPage {...pageProps} overview={overview} onDiscuss={create} onRefresh={refreshCurrent} onContinue={id=>go("bills/payments",id)}/>:<BillingPage revision={revision} mode={section as "entries"|"analysis"|"import"}/> : domain==="accounts"?section==="cards"?<CardsPage {...pageProps}/>:<div className="data-page"><AccountOverview overview={overview} loading={loading} error={overviewError} refresh={()=>void refreshOverview()} expanded accountsOnly={section==="accounts"}/></div> : domain==="wealth"?<WealthPage {...pageProps} section={section} accounts={overview?.accounts??[]} onRefresh={refreshCurrent}/>:<SubscriptionsPage {...pageProps}/>}
+      {business && <nav inert={!!management} className="section-tabs" aria-label={`${heading}二级导航`}>{sections[domain!].map(([id,label])=><button key={id} className={id===section?"active":""} aria-current={id===section?"page":undefined} onClick={()=>go(`${domain}/${id}`)}>{label}</button>)}</nav>}
+      <div ref={sidePanel.workspaceRef} className={`workspace-layout ${sidePanel.overlay?"side-overlay":""} ${(management || chatVisible && business && !drawer)?"with-chat-panel":""}`}>
+        <div inert={!!management} className={`workspace-content ${!business && detail ? "hidden" : ""}`}>
+          {!business ? <p className="loading-copy">{error?"暂时无法读取对话。":"正在恢复对话…"}</p> : domain==="bills" ? section==="payments"?<PaymentsPage {...pageProps} onManage={openManagement} managementBlocked={!!pending||!!management} overview={overview} onDiscuss={create} onRefresh={refreshCurrent} onContinue={id=>go("bills/payments",id)}/>:<BillingPage onManage={openManagement} managementBlocked={!!pending||!!management||chatBusy||decisionBusy||actionBusy} revision={revision} mode={section as "entries"|"analysis"|"import"}/> : domain==="accounts"?section==="cards"?<CardsPage {...pageProps}/>:<div className="data-page"><AccountOverview overview={overview} loading={loading} error={overviewError} refresh={()=>void refreshOverview()} expanded accountsOnly={section==="accounts"}/></div> : domain==="wealth"?<WealthPage {...pageProps} section={section} accounts={overview?.accounts??[]} onRefresh={refreshCurrent}/>:section==="arrangements"?<ArrangementsPage {...pageProps} onManage={openManagement} managementBlocked={!!pending||!!management} accounts={overview?.accounts??[]} pending={pending} onClearAction={id=>{if(pending?.id===id){setPending(null);setDrawer(false);}}} onRefresh={refreshCurrent} onContinue={id=>go("life/arrangements",id)}/>:<SubscriptionsPage {...pageProps} onManage={openManagement} managementBlocked={!!pending||!!management||actionBusy}/>}
         </div>
-        {chatVisible && <aside className={`chat-panel ${!business?"full-chat":""} ${drawer && business?"hidden":""}`} aria-label={business?"对话侧面板":"完整对话"}>{business && !drawer && sidePanel.separator}{business && <header className="panel-header"><h2>{current?.title??"新对话"}</h2><button className="icon-button" aria-label="放大对话" onClick={()=>go(scope,activeId,true)}><Maximize2 size={17}/></button><button className="icon-button" aria-label="关闭对话面板" onClick={()=>go(scope)}><X size={18}/></button></header>}{chat}</aside>}
-        {pending && drawer && <div className="confirmation-slot">{sidePanel.separator}<button className="text-button back-to-chat" onClick={closeDrawer}><ArrowLeft size={15}/> 返回对话</button><ActionDrawer key={`${activeId}:${pending.id}`} action={pending} accounts={overview?.accounts??[]} conversationId={activeId} chatBusy={chatBusy||actionBusy} onClose={closeDrawer} onBusy={setDecisionBusy} onDone={()=>{setPending(null);setDrawer(false);setDecisionBusy(false);refreshCurrent();}}/></div>}
+        {chatVisible && <aside className={`chat-panel ${!business?"full-chat":""} ${(management || drawer && business)?"hidden":""}`} aria-label={business?"对话侧面板":"完整对话"}>{business && !drawer && !management && sidePanel.separator}{business && <header className="panel-header"><h2>{current?.title??"新对话"}</h2><button className="icon-button" aria-label="放大对话" onClick={()=>go(scope,activeId,true)}><Maximize2 size={17}/></button><button className="icon-button" aria-label="关闭对话面板" onClick={()=>go(scope)}><X size={18}/></button></header>}{chat}</aside>}
+        {management && <div className="confirmation-slot management-slot">{sidePanel.separator}{management.kind!=="contacts"&&management.kind!=="services"?<RecordPanel request={management} onClose={closeManagement} onChanged={refreshCurrent}/>:<ManagementPanel request={management} onClose={closeManagement} onChanged={refreshCurrent} onViewTasks={()=>{closeManagement();go(management.kind==="contacts"?"bills/payments":"life/arrangements",activeId);}}/>}</div>}
+        {!management && pending && drawer && <div className="confirmation-slot">{sidePanel.separator}<button className="text-button back-to-chat" onClick={closeDrawer}><ArrowLeft size={15}/> 返回对话</button><ActionDrawer key={`${activeId}:${pending.id}`} action={pending} accounts={overview?.accounts??[]} conversationId={activeId} chatBusy={chatBusy||actionBusy} onDirtyChange={setWorkflowDirty} onEditingChange={setWorkflowEditing} onRevised={action=>{setWorkflowEditing(false);setWorkflowDirty(false);acceptAction(action);setDecisionBusy(false);void loadConversation(activeId);void refreshList();}} onClose={closeDrawer} onBusy={setDecisionBusy} onDone={()=>{setPending(null);setDrawer(false);setDecisionBusy(false);refreshCurrent();}}/></div>}
       </div>
     </main>
   </div>;
